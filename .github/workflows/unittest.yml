@@ -1,12 +1,24 @@
 name: Python Unittest Coverage
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_ref:
+        description: Commit to test (defaults to the triggering commit)
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   test:
     if: false == contains(github.event.pull_request.title, 'WIP')
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-26]
         python-version: ['3.11']
@@ -14,6 +26,9 @@ jobs:
       OS: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.test_ref || github.sha }}
+        persist-credentials: false
     - name: Install uv
       uses: astral-sh/setup-uv@v5
       with:
@@ -28,6 +43,15 @@ jobs:
       run: |
         uv pip install -q -e .[dev]
         uv pip install coverage pytest
+    - uses: pnpm/action-setup@v4
+      with:
+        version: 10
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+    - name: Install business fixture parser
+      working-directory: src/agentscope/business
+      run: pnpm install --frozen-lockfile
     - name: Run tests with coverage
       env:
         GRPC_VERBOSITY: ERROR
