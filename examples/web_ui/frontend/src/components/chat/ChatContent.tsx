@@ -143,6 +143,7 @@ interface ChatContentProps {
 	fileProcessor: (file: File) => Promise<ContentBlock | null>;
 	/** Agent owning the open session — drives the directory picker. */
 	agentId: string | null;
+	allowEnterpriseBusiness?: boolean;
 	/** The open session, whose working directory the picker edits. */
 	sessionId: string | null;
 	/** Current working directory, relative to the workspace root. */
@@ -189,6 +190,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	allowedInputTypes,
 	fileProcessor,
 	agentId,
+	allowEnterpriseBusiness = false,
 	sessionId,
 	cwd,
 	onCwdChange,
@@ -468,6 +470,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 						key={JSON.stringify([agentId, sessionId])}
 						className="min-w-full max-w-full w-full rounded-[32px] bg-muted p-1"
 						onSend={handleSend}
+						mentionTarget={agentId && allowEnterpriseBusiness && !acceptsInput ? '@企业业务' : undefined}
 						disabled={disabled}
 						autoComplete={autoComplete}
 						allowedInputTypes={acceptsInput ? [] : allowedInputTypes}

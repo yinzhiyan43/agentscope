@@ -30,6 +30,8 @@ class ErrorType(StrEnum):
     """429 — rate/quota exceeded."""
     INVALID_REQUEST = "invalid_request"
     """400 / 422 — malformed request."""
+    CONTEXT_CAPACITY = "context_capacity"
+    """The prompt exceeds the model's context or available memory."""
     UPSTREAM = "upstream"
     """5xx — an upstream service failed."""
     CONNECTION = "connection"

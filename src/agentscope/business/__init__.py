@@ -2,6 +2,7 @@
 """Source-backed business tools for client actions with OpenAPI contracts."""
 
 from ._business import as_tool, build, discover, preview
+from ._enterprise import EnterpriseBusiness, EnterpriseReadAPI
 from ._registry import BusinessRegistry
 from ._save_operation import write_save_receipt
 from ._save_registry import SaveBusinessRegistry
@@ -11,6 +12,8 @@ from .row_references import RowActionSource, RowDetailTools, RowScope
 __all__ = [
     "as_tool",
     "BusinessRegistry",
+    "EnterpriseBusiness",
+    "EnterpriseReadAPI",
     "RowActionSource",
     "RowDetailTools",
     "RowScope",

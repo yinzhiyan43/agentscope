@@ -58,6 +58,7 @@ interface ProcessedFile {
 }
 
 interface TextInputProps {
+	mentionTarget?: string;
 	onSend: (blocks: ContentBlock[]) => Promise<void> | void;
 	placeholder?: string;
 	autoComplete?: (input: string) => string | null;
@@ -158,6 +159,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 	(
 		{
 			onSend,
+			mentionTarget,
 			placeholder,
 			autoComplete,
 			disabled = false,
@@ -184,6 +186,11 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 		const { t } = useTranslation();
 		const defaultPlaceholder = placeholder || t('chat.inputPlaceholder');
 		const [value, setValue] = useState('');
+		const [mentionCursor, setMentionCursor] = useState<number | null>(null);
+		const mention = mentionCursor === null ? undefined :
+			value.slice(0, mentionCursor).match(/(?:^|[^\w@])(@[^@\s]*)$/u)?.[1];
+		const mentionVisible = !!mention && !!mentionTarget && mention !== mentionTarget &&
+			mentionTarget.startsWith(mention);
 		const [files, setFiles] = useState<ProcessedFile[]>([]);
 		const [isFocused, setIsFocused] = useState(false);
 		const [submitting, setSubmitting] = useState(false);
@@ -195,6 +202,14 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 			};
 		}, []);
 		const textareaRef = useRef<HTMLTextAreaElement>(null);
+		const cursorAfterMention = useRef<number | null>(null);
+		useLayoutEffect(() => {
+			const cursor = cursorAfterMention.current;
+			if (cursor !== null) {
+				textareaRef.current?.setSelectionRange(cursor, cursor);
+				cursorAfterMention.current = null;
+			}
+		}, [value]);
 		const hasAutoFocused = useRef(false);
 		useEffect(() => {
 			if (disabled || hasAutoFocused.current || !textareaRef.current) return;
@@ -298,10 +313,10 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 		})();
 
 		// Derive the accept attribute for the hidden file input
-		const acceptAttr =
-			allowedInputTypes && allowedInputTypes.length > 0
-				? allowedInputTypes.join(',')
-				: undefined;
+		const acceptsText = allowedInputTypes?.some((type) => type === 'text/plain' || type === 'text/*');
+		const acceptAttr = allowedInputTypes?.length
+			? [...allowedInputTypes, ...(acceptsText ? ['.json', '.yaml', '.yml'] : [])].join(',')
+			: undefined;
 
 		// Attachment button is disabled when the model explicitly accepts no file types
 		const attachDisabled =
@@ -366,7 +381,32 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 			return '';
 		}, [value, autoComplete, isFocused]);
 
+		const insertMention = () => {
+			const textarea = textareaRef.current;
+			if (!textarea || !mention || !mentionTarget || mentionCursor === null) return;
+			const start = mentionCursor - mention.length;
+			const suffix = value.slice(textarea.selectionEnd);
+			const insert = mentionTarget + (/^\s/u.test(suffix) ? '' : ' ');
+			cursorAfterMention.current = start + insert.length;
+			setValue(value.slice(0, start) + insert + suffix);
+			setMentionCursor(null);
+			textarea.focus();
+		};
+
 		const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+			if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+			if (mentionVisible) {
+				if (e.key === 'Escape') {
+					e.preventDefault();
+					setMentionCursor(null);
+					return;
+				}
+				if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey) {
+					e.preventDefault();
+					insertMention();
+					return;
+				}
+			}
 			// Tab key to select autocomplete
 			if (e.key === 'Tab' && suggestion) {
 				e.preventDefault();
@@ -517,7 +557,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 							(prev) =>
 								prev
 									.map((f) =>
-										f.name === file.name && f.status === 'processing'
+										f === placeholder
 											? block
 												? { ...f, status: 'done', block }
 												: null
@@ -531,7 +571,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 						// Just silently remove the entry here.
 						setFiles((prev) =>
 							prev.filter(
-								(f) => !(f.name === file.name && f.status === 'processing'),
+								(f) => f !== placeholder,
 							),
 						);
 					});
@@ -563,7 +603,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 								}
 
 								return (
-									<Attachment>
+									<Attachment key={index}>
 										<AttachmentMedia variant={isImage ? 'image' : 'icon'}>
 											{file.status === 'processing' ? (
 												<Loader2 className="size-3 shrink-0 animate-spin" />
@@ -640,12 +680,24 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 						<div
 							className={cn('relative min-w-0', isStacked ? 'basis-full' : 'flex-1')}
 						>
+							{mentionVisible && isFocused && (
+								<div className="absolute bottom-full left-0 z-20 mb-2 rounded-lg border bg-popover p-1 shadow-md">
+									<Button type="button" variant="ghost" size="sm"
+										onMouseDown={(event) => event.preventDefault()} onClick={insertMention}>
+										{mentionTarget}
+									</Button>
+								</div>
+							)}
 							{/* ``block`` — inline-block would sit on the text baseline and
 							    leave a descender gap that makes the wrapper taller. */}
 							<textarea
 								ref={textareaRef}
 								value={value}
-								onChange={(e) => setValue(e.target.value)}
+								onChange={(e) => {
+									setValue(e.target.value);
+									setMentionCursor(e.target.selectionStart);
+								}}
+								onSelect={(e) => setMentionCursor(e.currentTarget.selectionStart)}
 								onKeyDown={handleKeyDown}
 								onFocus={() => setIsFocused(true)}
 								onBlur={() => setIsFocused(false)}

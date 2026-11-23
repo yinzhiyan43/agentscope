@@ -47,6 +47,13 @@ def tool_login_scope(
         _scope.reset(token)
 
 
+class LoginOption(BaseModel):
+    """A display label and opaque choice for the current form step."""
+
+    value: str
+    label: str
+
+
 class LoginField(BaseModel):
     """An input declared by the service adapter."""
 
@@ -54,6 +61,7 @@ class LoginField(BaseModel):
     label: str
     kind: Literal["text", "secret"] = "text"
     required: bool = True
+    options: list[LoginOption] | None = None
 
 
 class LoginStep(BaseModel):
@@ -465,7 +473,13 @@ class ToolLogin:
         step = pending.view.step
         fields = {item.name for item in step.fields}
         if values.keys() - fields or any(
-            item.required and not values.get(item.name) for item in step.fields
+            (item.required and not values.get(item.name))
+            or (
+                item.options is not None
+                and values.get(item.name)
+                and values[item.name] not in {o.value for o in item.options}
+            )
+            for item in step.fields
         ):
             raise LoginRejected(
                 "Complete the fields in the current login form.",

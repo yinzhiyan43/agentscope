@@ -23,6 +23,13 @@ HERE = Path(__file__).resolve().parent
 FORMAT = "agentscope.business-tool.v1"
 
 
+def definition_digest(value: Any) -> str:
+    """Hash a JSON definition independently of mapping order."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, allow_nan=False).encode(),
+    ).hexdigest()
+
+
 def node(script: str, *args: str, data: dict | None = None) -> dict:
     """Run the local parser or interpreter, never the selected client."""
     with TemporaryFile(mode="w+", encoding="utf-8") as payload:
@@ -46,10 +53,24 @@ def dereference(
     value: Any,
     document: dict,
     trail: tuple[str, ...] = (),
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
 ) -> Any:
     """Resolve local JSON pointers so the artifact works offline."""
+    if budget is None:
+        budget = [20000]
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 100:
+        raise ValueError(
+            "Expanded OpenAPI schema is too large or deeply nested"
+        )
+    depth += 1
     if isinstance(value, list):
-        return [dereference(item, document, trail) for item in value]
+        return [
+            dereference(item, document, trail, depth=depth, budget=budget)
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
     if "$dynamicRef" in value or "$id" in value:
@@ -65,8 +86,13 @@ def dereference(
         target = document
         for key in ref[2:].split("/"):
             target = target[key.replace("~1", "/").replace("~0", "~")]
-        return dereference(target, document, (*trail, ref))
-    return {k: dereference(v, document, trail) for k, v in value.items()}
+        return dereference(
+            target, document, (*trail, ref), depth=depth, budget=budget
+        )
+    return {
+        key: dereference(item, document, trail, depth=depth, budget=budget)
+        for key, item in value.items()
+    }
 
 
 def openapi_schema(schema: dict, version: str) -> dict:
@@ -107,10 +133,48 @@ def json_schema(content: dict, version: str) -> dict | bool:
     return schema
 
 
+def resolve_path_items(document: dict, diagnostics: list[str]) -> dict:
+    """Resolve local Path Item references before enumerating operations."""
+    paths = {}
+    for route, item in document["paths"].items():
+        seen = set()
+        try:
+            while isinstance(item, dict) and "$ref" in item:
+                ref = item["$ref"]
+                if (
+                    not isinstance(ref, str)
+                    or not ref.startswith("#/")
+                    or ref in seen
+                ):
+                    raise ValueError("Invalid local Path Item reference")
+                seen.add(ref)
+                target = document
+                for part in ref[2:].split("/"):
+                    target = target[part.replace("~1", "/").replace("~0", "~")]
+                siblings = {k: v for k, v in item.items() if k != "$ref"}
+                if (
+                    not isinstance(target, dict)
+                    or siblings.keys() & target.keys()
+                ):
+                    raise ValueError("Conflicting Path Item fields")
+                item = {**target, **siblings}
+            if not isinstance(item, dict):
+                raise ValueError("Invalid Path Item")
+            paths[route] = item
+        except (KeyError, TypeError, ValueError):
+            diagnostics.append("unresolved_path_reference: " + route)
+    return {**document, "paths": paths}
+
+
 def bind_operation(document: dict, endpoint: dict) -> dict:
     """Match verb and route shape and retain the applicable wire contracts."""
     if not document.get("openapi", "").startswith(("3.0.", "3.1.")):
         raise ValueError("An OpenAPI 3.x JSON document is required")
+    if any(
+        isinstance(item, dict) and "$ref" in item
+        for item in document["paths"].values()
+    ):
+        document = resolve_path_items(document, [])
     source_route = re.sub(r"\{\d+\}", "{}", endpoint["template"])
     verb = endpoint["method"].lower()
     candidates = [
@@ -123,9 +187,20 @@ def bind_operation(document: dict, endpoint: dict) -> dict:
             f"Expected one OpenAPI match for {verb.upper()} {source_route}, "
             f"found {len(candidates)}",
         )
-    route, item = candidates[0]
+    route, _ = candidates[0]
+    return bind_route(document, route, verb)
+
+
+def bind_route(
+    document: dict,
+    route: str,
+    verb: str,
+    tool_name: str | None = None,
+) -> dict:
+    """Compile a known verb and route without matching a client template."""
+    item = document["paths"][route]
     op = dereference(item[verb], document)
-    name = op.get("operationId", "")
+    name = tool_name or op.get("operationId", "")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("A tool-compatible operationId is required")
 
@@ -333,8 +408,24 @@ def build(
             )
         Draft202012Validator.check_schema(correction["schema"])
         parent[parts[-1]] = correction["schema"]
+    return {
+        **compile_source_plan(plan, operation),
+        "profile": profile,
+        "apiEvidence": {
+            "file": openapi.name,
+            "pointer": "/paths/"
+            + operation["route"].replace("~", "~0").replace("/", "~1")
+            + "/"
+            + plan["endpoint"]["method"].lower(),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+    }
+
+
+def compile_source_plan(plan: dict, operation: dict) -> dict:
+    """Bind a statically traced client plan to a compiled wire contract."""
     params = plan["functions"][plan["entry"]]["params"]
-    schema = {
+    schema: dict = {
         "type": "object",
         "properties": {p["name"]: p["schema"] for p in params},
         "required": [p["name"] for p in params if not p["optional"]],
@@ -395,15 +486,6 @@ def build(
         "operation": operation,
         "inputSchema": schema,
         "plan": plan,
-        "profile": profile,
-        "apiEvidence": {
-            "file": openapi.name,
-            "pointer": "/paths/"
-            + operation["route"].replace("~", "~0").replace("/", "~1")
-            + "/"
-            + plan["endpoint"]["method"].lower(),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        },
     }
 
 
@@ -422,6 +504,29 @@ def preview(artifact: dict, inputs: dict) -> dict:
     if artifact.get("format") != FORMAT:
         raise ValueError("Unsupported tool definition")
     validate(artifact["inputSchema"], inputs, "Tool input")
+    if artifact["plan"].get("directOpenAPI"):
+        op = artifact["operation"]
+        path_values = inputs.get("path", {})
+        segments = [str(value) for value in path_values.values()]
+        if any(
+            value in ("", ".", "..") or re.search(r"[/\\%]", value)
+            for value in segments
+        ):
+            raise ValueError(
+                "Path parameters must be single, unescaped path segments",
+            )
+        request = {
+            "method": artifact["plan"]["endpoint"]["method"],
+            "path": re.sub(
+                r"\{([^{}]+)\}",
+                lambda match: quote(str(path_values[match[1]]), safe=""),
+                op["route"],
+            ),
+            "query": inputs.get("query", {}),
+        }
+        if "body" in inputs:
+            request["body"] = inputs["body"]
+        return request
     req = node("prepare.mjs", data={"plan": artifact["plan"], "input": inputs})
     op = artifact["operation"]
     wire = {
@@ -438,6 +543,12 @@ def preview(artifact: dict, inputs: dict) -> dict:
     for param in op["parameters"]:
         key, location = param["name"], param["in"]
         if key in wire[location]:
+            if (
+                location == "path"
+                and artifact.get("profile", {}).get("singlePathSegments")
+                and re.search(r"[/\\%]", str(wire[location][key]))
+            ):
+                raise ValueError("Path parameters must be single segments")
             validate(param["schema"], wire[location][key], key)
         elif param.get("required"):
             raise ValueError(f"Missing {location} parameter {key}")

@@ -106,6 +106,14 @@ class ClassifyErrorTest(unittest.TestCase):
                     (429, ErrorType.RATE_LIMIT),
                 )
 
+    def test_prefill_memory_guard_rejection(self) -> None:
+        error = _StatusError(400)
+        error.args = (
+            "oMLX prefill memory guard rejected this prompt: details",
+        )
+        self.assertEqual(_classify_type(error), ErrorType.CONTEXT_CAPACITY)
+        self.assertNotIn("details", _classify_error(error).message)
+
     def test_httpx_connection_errors(self) -> None:
         """httpx transport failures classify as CONNECTION."""
         # These are httpx.TransportError subclasses, NOT builtin

@@ -26,6 +26,7 @@ import type {
 	UpdateSessionRequest,
 } from '@/api';
 import { asrApi, sessionApi } from '@/api';
+import { enterpriseSkillKey } from '@/api/enterpriseBusiness';
 import MCPSvg from '@/assets/images/mcp.svg?react';
 import { ChatContent } from '@/components/chat/ChatContent.tsx';
 import { SubagentHitlCard } from '@/components/chat/SubagentHitlCard';
@@ -74,6 +75,7 @@ import { useWorkspace } from '@/hooks/useWorkspace.ts';
 import { useWorkspaceStatus } from '@/hooks/useWorkspaceStatus';
 import { useTranslation } from '@/i18n/useI18n';
 import { getPendingHitlCalls } from '@/lib/pendingToolCalls';
+import { queryClient } from '@/lib/query-client';
 
 const REALTIME_EXCLUDED_ENUM_VALUES: Record<string, unknown[]> = {
 	turn_detection: ['none'],
@@ -346,6 +348,13 @@ export function ChatViewport({
 		sendRealtimeUserConfirm: realtimeVoice.userConfirm,
 		sendRealtimeExternalExecutionResult: realtimeVoice.externalExecutionResult,
 	});
+	const lastPhase = useRef(phase);
+	useEffect(() => {
+		if (phase === 'idle' && lastPhase.current !== 'idle' && agentId) {
+			void queryClient.invalidateQueries({ queryKey: enterpriseSkillKey(agentId) });
+		}
+		lastPhase.current = phase;
+	}, [phase, agentId]);
 	const {
 		mcps,
 		loading: mcpsLoading,
@@ -546,6 +555,8 @@ export function ChatViewport({
 				icon: <BookText className="size-4" />,
 				content: (
 					<SkillPanel
+						agentId={agentId}
+						sessionId={sessionId}
 						skills={skills}
 						loading={skillsLoading}
 						onUpload={uploadSkill}
@@ -613,6 +624,7 @@ export function ChatViewport({
 		}),
 		[
 			t,
+			agentId,
 			backgroundData,
 			backgroundUnavailable,
 			backgroundLoading,
@@ -1113,6 +1125,7 @@ export function ChatViewport({
 									loading={messagesLoading}
 									agentId={agentId}
 									sessionId={sessionId}
+									allowEnterpriseBusiness={!voiceBusy}
 									cwd={view?.session.config.cwd ?? null}
 									onCwdChange={handleCwdChange}
 									git={workspaceStatus?.git ?? null}
@@ -1200,7 +1213,8 @@ export function ChatViewport({
 									)}
 									fileProcessor={async (file) => {
 										const filePath = (file as File & { path?: string }).path;
-										if (filePath) {
+										const textDocument = /\.(json|ya?ml)$/i.test(file.name);
+										if (filePath && !textDocument) {
 											return {
 												id: crypto.randomUUID(),
 												type: 'data' as const,
@@ -1214,7 +1228,7 @@ export function ChatViewport({
 												created_at: new Date().toISOString(),
 											};
 										}
-										if (file.type === 'text/plain') {
+										if (file.type === 'text/plain' || textDocument) {
 											const text = await file.text();
 											return {
 												id: crypto.randomUUID(),

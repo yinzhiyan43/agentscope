@@ -97,7 +97,9 @@ function load(file) {
     } else if (ts.isImportDeclaration(statement)) {
       const from = statement.moduleSpecifier.text;
       const clause = statement.importClause;
-      if ((from === 'axios' || from === options.httpClient) && clause?.name && !clause.isTypeOnly) clients.set(clause.name.text, statement);
+      const localClient = options.inferLocalHttpClients && /^(?:@\/|\.\.?\/)/.test(from);
+      if ((from === 'axios' || from === options.httpClient || localClient) &&
+          clause?.name && !clause.isTypeOnly) clients.set(clause.name.text, statement);
       const named = clause?.namedBindings;
       if (!clause?.isTypeOnly && named && ts.isNamedImports(named) && (from.startsWith('.') || from.startsWith('@/'))) {
         for (const item of named.elements) {
@@ -377,23 +379,32 @@ function buildPlan(module, symbol) {
     hashes: Object.fromEntries([...used].map(file => [file, hashes[file]])) };
 }
 
+let discoveredFiles = 0;
+function discoverFile(file, actions, diagnostics) {
+  if (!/\.(vue|js|ts|mjs)$/.test(file) || file.endsWith('.d.ts')) return;
+  discoveredFiles++;
+  let module;
+  try { module = load(file); } catch (err) { diagnostics.push(err.message); return; }
+  for (const name of module.defs.keys()) {
+    try {
+      const plan = buildPlan(module, name);
+      const action = { entry: plan.entry, endpoint: plan.endpoint, calls: Object.keys(plan.functions).filter(f => f !== plan.entry) };
+      if (options.includePlans) action.plan = plan;
+      actions.push(action);
+    } catch (err) {
+      diagnostics.push(module.relative + '#' + name + ': ' + err.message);
+    }
+  }
+}
+
 function discover(dir, actions, diagnostics) {
-  const skip = new Set(['node_modules', 'dist', 'build', 'coverage']);
+  const skip = new Set(['node_modules', 'dist', 'build', 'coverage', 'target', 'vendor']);
   for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (options.discoveryLimit && discoveredFiles >= options.discoveryLimit) return;
     if (item.name.startsWith('.') || skip.has(item.name) || item.isSymbolicLink()) continue;
     const file = path.join(dir, item.name);
     if (item.isDirectory()) { discover(file, actions, diagnostics); continue; }
-    if (!/\.(vue|js|ts|mjs)$/.test(file) || file.endsWith('.d.ts')) continue;
-    let module;
-    try { module = load(file); } catch (err) { diagnostics.push(err.message); continue; }
-    for (const name of module.defs.keys()) {
-      try {
-        const plan = buildPlan(module, name);
-        actions.push({ entry: plan.entry, endpoint: plan.endpoint, calls: Object.keys(plan.functions).filter(f => f !== plan.entry) });
-      } catch (err) {
-        diagnostics.push(module.relative + '#' + name + ': ' + err.message);
-      }
-    }
+    if (item.isFile()) discoverFile(file, actions, diagnostics);
   }
 }
 
@@ -420,8 +431,12 @@ try {
     console.log(JSON.stringify(inference));
   } else if (entryFile === '--discover') {
     const actions = [], diagnostics = [];
-    discover(root, actions, diagnostics);
-    console.log(JSON.stringify({ actions, diagnostics }));
+    if (options.selectedFile) discoverFile(path.resolve(root, options.selectedFile), actions, diagnostics);
+    else discover(root, actions, diagnostics);
+    console.log(JSON.stringify({
+      actions, diagnostics,
+      truncated: Boolean(options.discoveryLimit && discoveredFiles >= options.discoveryLimit),
+    }));
   } else {
     console.log(JSON.stringify(buildPlan(load(path.resolve(root, entryFile)), entryName)));
   }

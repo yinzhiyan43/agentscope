@@ -21,7 +21,13 @@ interface LoginView {
 		title: string;
 		description: string;
 		submit_label: string;
-		fields: Array<{ name: string; label: string; kind: 'text' | 'secret'; required: boolean }>;
+		fields: Array<{
+			name: string;
+			label: string;
+			kind: 'text' | 'secret';
+			required: boolean;
+			options?: Array<{ value: string; label: string }> | null;
+		}>;
 	};
 }
 
@@ -130,15 +136,33 @@ function LoginForm({
 						return (
 							<div key={field.name} className="grid gap-2">
 								<Label htmlFor={id}>{field.label}</Label>
-								<Input
-									id={id}
-									name={field.name}
-									type={field.kind === 'secret' ? 'password' : 'text'}
-									autoComplete="off"
-									required={field.required}
-									disabled={pending}
-									maxLength={4096}
-								/>
+								{field.options ? (
+									<select
+										id={id}
+										name={field.name}
+										required={field.required}
+										disabled={pending}
+										defaultValue=""
+										className="border-input bg-background h-9 rounded-md border px-3"
+									>
+										<option value="" />
+										{field.options.map((option) => (
+											<option key={option.value} value={option.value}>
+												{option.label}
+											</option>
+										))}
+									</select>
+								) : (
+									<Input
+										id={id}
+										name={field.name}
+										type={field.kind === 'secret' ? 'password' : 'text'}
+										autoComplete="off"
+										required={field.required}
+										disabled={pending}
+										maxLength={4096}
+									/>
+								)}
 							</div>
 						);
 					})}

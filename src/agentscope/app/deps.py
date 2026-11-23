@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared FastAPI dependencies for the agentscope app."""
+from urllib.parse import urlsplit
+
 from fastapi import Header, HTTPException, Request, status
 
 from .workspace_manager import WorkspaceManagerBase
@@ -33,26 +35,46 @@ from ..rag import ChunkerBase, ParserBase
 
 
 async def get_current_user_id(
-    x_user_id: str = Header(
-        description="Caller's user ID. "
-        "Temporary header-based identity; will be replaced by JWT auth.",
-    ),
+    request: Request,
+    x_user_id: str | None = Header(default=None),
 ) -> str:
-    """Return the caller's user ID from the ``X-User-ID`` request header.
-
-    Args:
-        x_user_id (`str`): Value of the ``X-User-ID`` header.
-
-    Returns:
-        `str`: The authenticated user ID.
-
-    Raises:
-        `HTTPException`: 401 if the header is missing or empty.
-    """
+    """Use the authenticated principal for protected enterprise identities."""
+    enterprise = getattr(request.app.state, "enterprise_business", None)
+    # Only server-side ASGI middleware can set this scope value.
+    principal = request.scope.get("agentscope.user_id")
+    authenticated = request.scope.get("user")
+    if principal is None and authenticated and authenticated.is_authenticated:
+        # Starlette display names need not be unique account identifiers.
+        try:
+            principal = authenticated.identity
+        except NotImplementedError:
+            principal = None
+    if isinstance(principal, str) and principal:
+        if x_user_id and principal != x_user_id:
+            raise HTTPException(
+                403, "Account does not match authenticated identity."
+            )
+        return principal
     if not x_user_id:
+        raise HTTPException(401, "X-User-ID header is required.")
+    if enterprise and (
+        request.url.path.rstrip("/").endswith(
+            ("/enterprise-business", "/enterprise-business/skills")
+        )
+        or enterprise.protects_user(x_user_id)
+    ):
+        origin = request.headers.get("origin")
+        loopback = {"localhost", "127.0.0.1", "::1"}
+        if (
+            x_user_id == enterprise.local_user
+            and request.client
+            and request.client.host in loopback
+            and request.url.hostname in loopback
+            and (origin is None or urlsplit(origin).hostname in loopback)
+        ):
+            return enterprise.local_user
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="X-User-ID header is required.",
+            401, "Enterprise business requires an authenticated identity."
         )
     return x_user_id
 

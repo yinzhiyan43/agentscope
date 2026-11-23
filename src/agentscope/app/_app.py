@@ -38,7 +38,9 @@ from ._router import (
     workspace_router,
 )
 from ._router._tool_login import tool_login_router
+from ._router._enterprise_business import enterprise_business_router
 from .tool_login import ToolLogin
+from ._enterprise_login import EnterpriseLogin
 from ._types import (
     AgentMiddlewareFactory,
     AgentToolFactory,
@@ -49,8 +51,10 @@ from .channel import ChannelBase, ChannelTypeRegistry
 from .message_bus import MessageBus
 from .storage import StorageBase
 from ..agent import Agent
+from ..business._enterprise import EnterpriseBusiness
 from ..credential import CredentialFactory, CredentialBase
 from ..rag import ApproxTokenChunker, ChunkerBase, ParserBase, TextParser
+from ..tool import ToolBase
 
 from .._logging import logger
 from .._version import __version__
@@ -134,6 +138,7 @@ def create_app(
     extra_middlewares: list[FastAPIMiddleware] | None = None,
     extra_agent_middlewares: AgentMiddlewareFactory | None = None,
     extra_agent_tools: AgentToolFactory | None = None,
+    enterprise_business: EnterpriseBusiness | None = None,
     tool_login: ToolLogin | None = None,
     tool_offload_timeout_secs: float | None = 10.0,
     custom_subagent_templates: list[SubAgentTemplate] | None = None,
@@ -282,6 +287,9 @@ def create_app(
             availability depends on the caller (per-tenant integrations,
             user-specific credentials).  The returned tools are added to
             the workspace-derived tools in the toolkit's ``"basic"`` group.
+        enterprise_business (`EnterpriseBusiness | None`, optional):
+            Agent-scoped storage and trusted source/API bindings for chat
+            imports. Defaults to the deployment's enterprise business config.
         tool_login (`ToolLogin | None`, optional):
             Private interactive authentication for enabled service tools.
         custom_subagent_templates (`list[SubAgentTemplate] | None`, optional):
@@ -349,7 +357,44 @@ def create_app(
     app.state.workspace_manager = workspace_manager
     app.state.knowledge_base_manager = knowledge_base_manager
     app.state.extra_agent_middlewares = extra_agent_middlewares
-    app.state.extra_agent_tools = extra_agent_tools
+    enterprise_business = (
+        enterprise_business or EnterpriseBusiness.from_environment()
+    )
+    app.state.enterprise_business = enterprise_business
+    tool_login = tool_login or ToolLogin(message_bus)
+    enterprise_business.login = EnterpriseLogin(tool_login)
+
+    async def agent_tools(
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+    ) -> list[ToolBase]:
+        tools = (
+            await extra_agent_tools(user_id, agent_id, session_id)
+            if extra_agent_tools
+            else []
+        )
+        business_tools = await enterprise_business.tools(user_id, agent_id)
+        if (
+            enterprise_business.protects_user(user_id)
+            and await storage.get_agent(user_id, agent_id) is not None
+        ):
+
+            async def current_tools() -> list[ToolBase]:
+                return await app.state.extra_agent_tools(
+                    user_id, agent_id, session_id
+                )
+
+            business_tools += enterprise_business.chat_tools(
+                user_id, agent_id, current_tools
+            )
+        names = {tool.name for tool in tools}
+        return [
+            *tools,
+            *(tool for tool in business_tools if tool.name not in names),
+        ]
+
+    app.state.extra_agent_tools = agent_tools
     app.state.tool_login = tool_login
     app.state.tool_offload_timeout_secs = tool_offload_timeout_secs
     app.state.custom_agent_cls = custom_agent_cls
@@ -450,6 +495,7 @@ def create_app(
         background_task_router,
         chat_router,
         credential_router,
+        enterprise_business_router,
         health_router,
         hub_router,
         knowledge_base_router,

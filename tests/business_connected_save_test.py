@@ -10,7 +10,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock
 
-from agentscope.business import SaveBusinessRegistry, write_save_receipt
+from agentscope.business import (
+    EnterpriseBusiness,
+    SaveBusinessRegistry,
+    write_save_receipt,
+)
 from agentscope.message import ToolCallBlock
 from agentscope.state import AgentState
 from agentscope.tool import Toolkit, FunctionTool
@@ -131,8 +135,8 @@ class ConnectedSaveTest(unittest.IsolatedAsyncioTestCase):
             record["ticket"]["attributes"]["subject"] = "different"
         return {"id": key, "detail": record, "request": request}
 
-    def tools(self, target: str = "offline support") -> list[FunctionTool]:
-        """Build the tools available in the selected registry scope."""
+    def registry(self, target: str) -> SaveBusinessRegistry:
+        """Create the registry over the in-memory ticket service."""
 
         def project(_plan: dict, detail: dict) -> tuple[str, dict]:
             ticket = detail["ticket"]
@@ -142,7 +146,7 @@ class ConnectedSaveTest(unittest.IsolatedAsyncioTestCase):
                 {"title": fields["subject"]} if "subject" in fields else {},
             )
 
-        registry = SaveBusinessRegistry(
+        return SaveBusinessRegistry(
             self.root,
             self.spec,
             self.root / "published",
@@ -152,7 +156,48 @@ class ConnectedSaveTest(unittest.IsolatedAsyncioTestCase):
             tool_prefix="support",
             readback_view=project,
         )
-        return registry.tools("employee", "assistant")
+
+    def tools(self, target: str = "offline support") -> list[FunctionTool]:
+        return self.registry(target).tools("employee", "assistant")
+
+    async def test_import_reconciles_confirmed_saves(self) -> None:
+        registry = self.registry("offline support")
+        converter = EnterpriseBusiness(
+            self.root / "imports", save_registries={"employee": [registry]}
+        )
+        result = await converter.convert(
+            "employee", "assistant", self.spec.read_text()
+        )
+        pending = next(r for r in result["tools"] if r["method"] == "POST")
+        self.assertEqual(pending["reason"], "save_acceptance_required")
+        (registrar,) = await converter.tools("employee", "assistant")
+        self.assertEqual(registrar.name, pending["acceptance"]["registrar"])
+        self.assertEqual(self.records, {})
+        with self.assertRaises(ValueError):
+            await invoke(registrar, **{**self.request, "save_route": "/other"})
+        report = await invoke(registrar, **self.request)
+        self.assertTrue(report["registered"])
+        latest = await converter.latest("employee", "assistant")
+        self.assertIsNotNone(latest)
+        self.assertEqual(
+            next(
+                r["status"] for r in latest["tools"] if r["method"] == "POST"
+            ),
+            "registered",
+        )
+        tools = await converter.tools("employee", "assistant")
+        self.assertCountEqual(
+            [tool.name for tool in tools], [registrar.name, *report["tools"]]
+        )
+        self.assertEqual(await converter.tools("employee", "other"), [])
+        (self.root / "Ticket.vue").write_text("changed")
+        latest = await converter.latest("employee", "assistant")
+        self.assertEqual(
+            next(
+                r["status"] for r in latest["tools"] if r["method"] == "POST"
+            ),
+            "pending",
+        )
 
     async def publish(self) -> tuple[FunctionTool, FunctionTool]:
         """Register the fixture and return its save and read tools."""

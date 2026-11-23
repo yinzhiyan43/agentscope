@@ -240,15 +240,43 @@ class SaveBusinessRegistry:
         self.target_label = (target_label or "").strip()
         self.readback_view = readback_view
 
-    def tools(self, user_id: str, agent_id: str) -> list[FunctionTool]:
-        """Build the tools available in the selected registry scope."""
+    @property
+    def import_registrar_name(self) -> str:
+        return f"accept_business_{self.tool_prefix}"
+
+    def _directory(self, user_id: str, agent_id: str) -> Path:
         key = json.dumps([user_id, agent_id]).encode()
         storage = self.storage
-        registrar = "register_save_business_tool"
         if self.tool_prefix != "erp":
             storage = storage / self.tool_prefix
-            registrar = f"register_{self.tool_prefix}_save_business_tool"
-        directory = storage / hashlib.sha256(key).hexdigest()
+        return storage / hashlib.sha256(key).hexdigest()
+
+    def accepted_routes(self, user_id: str, agent_id: str) -> dict[str, str]:
+        """Return saves with current target and acceptance evidence."""
+        routes = {}
+        for path in self._directory(user_id, agent_id).glob("*.json"):
+            record = json.loads(path.read_bytes())
+            if self._current(record):
+                plan = record["plan"]
+                routes[plan["saveRoute"]] = plan["saveTool"]
+        return routes
+
+    def tools(
+        self,
+        user_id: str,
+        agent_id: str,
+        *,
+        routes: set[str] | None = None,
+    ) -> list[FunctionTool]:
+        """Build the registrar and published tools in the selected scope."""
+        directory = self._directory(user_id, agent_id)
+        registrar = (
+            "register_save_business_tool"
+            if self.tool_prefix == "erp"
+            else f"register_{self.tool_prefix}_save_business_tool"
+        )
+        if routes is not None:
+            registrar = self.import_registrar_name
 
         async def register_save_business_tool(
             business: str,
@@ -285,6 +313,8 @@ class SaveBusinessRegistry:
                     至少一组须独立于普通缺填样本，覆盖不同的实际输入和操作。
                     原客户端或生成工具尝试写入都会阻止注册，反例不写入目标系统。
             """
+            if routes is not None and save_route not in routes:
+                raise ValueError("该保存路径不在当前智能体的导入记录中。")
             return await self.register(
                 directory,
                 business,
@@ -318,7 +348,7 @@ class SaveBusinessRegistry:
             *(
                 tool
                 for path in sorted(directory.glob("*.json"))
-                for tool in self._published_tools(path)
+                for tool in self._published_tools(path, routes)
             ),
         ]
 
@@ -352,8 +382,12 @@ class SaveBusinessRegistry:
             raise ValueError("规则来源超出绑定源码目录")
         return hashlib.sha256(source.read_bytes()).hexdigest()
 
-    def _published_tools(self, path: Path) -> list[FunctionTool]:
+    def _published_tools(
+        self, path: Path, routes: set[str] | None = None
+    ) -> list[FunctionTool]:
         record = json.loads(path.read_bytes())
+        if routes is not None and record["plan"]["saveRoute"] not in routes:
+            return []
         save, read = self._runtime(record["plan"], path)
         if self._current(record):
             return [save, read]

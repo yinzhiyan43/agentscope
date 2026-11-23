@@ -46,6 +46,10 @@ _GENERIC_MESSAGE: dict[ErrorType, str] = {
     ErrorType.INVALID_REQUEST: (
         "The request to the model was rejected as invalid."
     ),
+    ErrorType.CONTEXT_CAPACITY: (
+        "The model cannot process this much context with its current "
+        "capacity. Shorten the conversation context and try again."
+    ),
     ErrorType.UPSTREAM: "The upstream model service returned an error.",
     ErrorType.CONNECTION: (
         "Could not reach the model service — network error or timeout."
@@ -117,6 +121,12 @@ def _classify_type(e: Exception) -> ErrorType:
     provider SDK."""
     status = _extract_status(e)
     if status is not None:
+        if status in (400, 413, 422) and any(
+            getattr(exc, "code", None) == "context_length_exceeded"
+            or "prefill memory guard rejected this prompt" in str(exc).lower()
+            for exc in _causes(e)
+        ):
+            return ErrorType.CONTEXT_CAPACITY
         if status in _STATUS_MAP:
             return _STATUS_MAP[status]
         if status >= 500:

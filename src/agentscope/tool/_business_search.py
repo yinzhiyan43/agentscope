@@ -164,26 +164,32 @@ class PublishedBusinessTool(FunctionTool):
         *,
         business: str | None,
         action: Literal["query", "save", "readback"],
+        display_name: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(func, **kwargs)
         self.business = business
+        self.display_name = display_name or business or self.name
         self.action = action
         self._title = _normalize(business or "").strip()
         self._title_terms = _terms(self._title)
         self._normalized_name = _normalize(self.name)
+        self._display_title = _normalize(self.display_name).strip()
         self._name_terms = _terms(self._normalized_name)
         self._parameters = _terms(
             _normalize(" ".join(_parameter_names(self.input_schema))),
         )
         self._description_terms = _terms(_normalize(self.description))
 
+    async def visible_in_catalog(self, state: AgentState) -> bool:
+        """Show bound operations allowed by this session's permissions."""
+        return bool(self.business) and await _permitted(self, state)
+
     async def show_schema(self, state: AgentState | None) -> bool:
         """Decide whether to expose this tool in the current session."""
         return state is None or (
-            bool(self.business)
-            and self.name in state.tool_context.selected_business_tools
-            and await _permitted(self, state)
+            self.name in state.tool_context.selected_business_tools
+            and await self.visible_in_catalog(state)
         )
 
     def score(self, query: str, terms: set[str], action: str) -> int:
@@ -198,6 +204,8 @@ class PublishedBusinessTool(FunctionTool):
             return 1000
         if self.action == "save" and action != "save":
             return 0
+        if self._display_title != self._title and self._display_title in query:
+            return 100
         title_hits = len(terms & self._title_terms)
         score = 0
         if self._title and self._title in query:
@@ -252,7 +260,7 @@ class BusinessToolSearch(FunctionTool):
         """Decide whether to expose this tool in the current session."""
         if state is not None and await _permitted(self, state):
             for tool in self.catalog:
-                if await _permitted(tool, state):
+                if await tool.visible_in_catalog(state):
                     return True
         return False
 
@@ -278,7 +286,7 @@ class BusinessToolSearch(FunctionTool):
             [
                 (tool.score(query, terms, action), tool)
                 for tool in catalog
-                if await _permitted(tool, _agent_state)
+                if await tool.visible_in_catalog(_agent_state)
             ],
             key=lambda item: (-item[0], item[1].name),
         )
@@ -297,6 +305,7 @@ class BusinessToolSearch(FunctionTool):
             "matches": [
                 {
                     "name": t.name,
+                    "display_name": t.display_name,
                     "business": t.business,
                     "action": _ACTION_LABELS[t.action],
                 }
