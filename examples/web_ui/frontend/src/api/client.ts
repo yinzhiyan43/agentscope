@@ -10,12 +10,14 @@ export const getUserId = () => localStorage.getItem('username') ?? '';
 export class ApiError extends Error {
 	readonly status: number;
 	readonly detail: string;
+	readonly data?: unknown;
 
-	constructor(status: number, detail: string) {
+	constructor(status: number, detail: string, data?: unknown) {
 		super(detail);
 		this.name = 'ApiError';
 		this.status = status;
 		this.detail = detail;
+		this.data = data;
 	}
 }
 
@@ -44,16 +46,22 @@ function buildHeaders(hasJsonBody: boolean, userId?: string): Record<string, str
 }
 
 /** Parse the response body and extract the `detail` field if the backend returned JSON. */
-async function extractErrorDetail(res: Response): Promise<string> {
+async function extractErrorDetail(res: Response): Promise<{ detail: string; data?: unknown }> {
 	const text = await res.text();
 	try {
 		const json = JSON.parse(text) as { detail?: unknown };
-		if (typeof json.detail === 'string') return json.detail;
-		if (json.detail !== undefined) return JSON.stringify(json.detail);
+		if (typeof json.detail === 'string') return { detail: json.detail };
+		if (json.detail !== undefined) {
+			const data = json.detail;
+			const message = data && typeof data === 'object' && 'code' in data && 'message' in data
+				? data.message
+				: undefined;
+			return { detail: typeof message === 'string' ? message : JSON.stringify(data), data };
+		}
 	} catch {
 		// not JSON – fall through
 	}
-	return text || res.statusText;
+	return { detail: text || res.statusText };
 }
 
 async function streamRequest(path: string, options: RequestOptions = {}): Promise<Response> {
@@ -107,8 +115,8 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 	}
 
 	if (!res.ok) {
-		const detail = await extractErrorDetail(res);
-		const error = new ApiError(res.status, detail);
+		const { detail, data } = await extractErrorDetail(res);
+		const error = new ApiError(res.status, detail, data);
 		if (!silent) toast.error(detail);
 		throw error;
 	}

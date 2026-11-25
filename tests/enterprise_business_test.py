@@ -1,22 +1,68 @@
 # -*- coding: utf-8 -*-
 """Exercise enterprise business import, verification, and Agent scoping."""
-from typing import Any
+
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
 import httpx
 
+from agentscope.business import _enterprise_catalog, _enterprise_convert
 from agentscope.business._enterprise import (
     EnterpriseBusiness,
     EnterpriseReadAPI,
 )
+from agentscope.business._enterprise_config import EnterpriseLimits
 
 
 class EnterpriseBusinessTest(IsolatedAsyncioTestCase):
     """An import is usable on its own and runs only approved read probes."""
+
+    async def test_configured_limits_apply_to_discovery_and_progress(
+        self,
+    ) -> None:
+        operations = {
+            f"/jobs/{i}": {"get": {"responses": {"204": {}}}} for i in range(3)
+        }
+        source = json.dumps({"openapi": "3.1.0", "paths": operations})
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "enterprise.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "directory": str(root / "imports"),
+                        "limits": {"page_size": 2, "max_operations": 3},
+                    }
+                )
+            )
+            with patch.dict(
+                "os.environ",
+                {"AGENTSCOPE_ENTERPRISE_BUSINESS_CONFIG": str(config)},
+            ):
+                enterprise = EnterpriseBusiness.from_environment()
+            first = await enterprise.discover("owner", "agent", source)
+            self.assertEqual(
+                (len(first["actions"]), first["next_offset"]), (2, 2)
+            )
+            second = await enterprise.progress(
+                "owner", "agent", inventory_id=first["inventory_id"], offset=2
+            )
+            self.assertEqual(
+                (len(second["actions"]), second["next_offset"]), (1, None)
+            )
+            operations["/jobs/3"] = operations["/jobs/0"]
+            with self.assertRaisesRegex(ValueError, "Limit each import to 3"):
+                await enterprise.discover(
+                    "owner",
+                    "agent",
+                    json.dumps({"openapi": "3.1.0", "paths": operations}),
+                )
+        with self.assertRaisesRegex(ValueError, "max_input_bytes"):
+            EnterpriseLimits(max_input_bytes=0)
 
     async def test_chat_inventory_progress_across_scopes_and_restarts(
         self,
@@ -190,23 +236,92 @@ class EnterpriseBusinessTest(IsolatedAsyncioTestCase):
             code = "import axios from 'axios';\nexport function reports(size: number = 20) {return axios.get('/reports', {params: {size: size}});}"
             script.write_text(code)
             client = httpx.AsyncClient
-            with patch(
-                "httpx.AsyncClient",
-                side_effect=lambda **kwargs: client(
-                    transport=httpx.MockTransport(
-                        lambda _: httpx.Response(204)
+            with (
+                patch.object(
+                    _enterprise_convert, "node", wraps=_enterprise_convert.node
+                ) as node,
+                patch(
+                    "httpx.AsyncClient",
+                    side_effect=lambda **kwargs: client(
+                        transport=httpx.MockTransport(
+                            lambda _: httpx.Response(204)
+                        ),
+                        **kwargs,
                     ),
-                    **kwargs,
                 ),
             ):
                 result = await converter.convert("u", "a", str(source))
-            self.assertEqual(result["tools"][0]["status"], "registered")
-            same = await converter.discover("u", "a", str(source))
-            self.assertEqual(same["counts"], {"registered": 1})
-            script.write_text(code.replace("= 20", "= 10"))
-            changed = await converter.discover("u", "a", str(source))
-            self.assertEqual(changed["counts"], {"discovered": 1})
-            self.assertEqual(changed["actions"][0]["basis"], "source")
+                self.assertEqual(result["tools"][0]["status"], "registered")
+                same = await converter.discover("u", "a", str(source))
+                self.assertEqual(same["counts"], {"registered": 1})
+                self.assertEqual(node.call_count, 1)
+                script.write_text(code.replace("= 20", "= 10"))
+                changed = await converter.discover("u", "a", str(source))
+                self.assertEqual(changed["counts"], {"discovered": 1})
+                self.assertEqual(changed["actions"][0]["basis"], "source")
+                self.assertEqual(node.call_count, 2)
+                (source / "new.ts").write_text(code)
+                await converter.discover("u", "a", str(source))
+                self.assertEqual(node.call_count, 3)
+
+    async def test_tool_cache_reuses_bindings_and_reconciles_live_files_and_grants(
+        self,
+    ) -> None:
+        doc = {
+            "openapi": "3.1.0",
+            "paths": {"/items": {"get": {"responses": {"204": {}}}}},
+        }
+        source = json.dumps(doc)
+        client = httpx.AsyncClient
+        with (
+            TemporaryDirectory() as tmp,
+            patch(
+                "httpx.AsyncClient",
+                side_effect=lambda **opts: client(
+                    transport=httpx.MockTransport(
+                        lambda _: httpx.Response(204)
+                    ),
+                    **opts,
+                ),
+            ),
+            patch.object(
+                _enterprise_convert, "_read", wraps=_enterprise_convert._read
+            ) as read,
+        ):
+            root = Path(tmp)
+            spec = root / "api.json"
+            spec.write_text(source)
+            samples = {"/items": {}}
+            api = EnterpriseReadAPI(spec, "https://example.test", samples)
+            converter = EnterpriseBusiness(
+                root / "data", read_apis={"u": [api]}
+            )
+            await converter.convert("u", "a", source)
+            (receipt,) = (root / "data").glob("*/*.json")
+            with patch.object(
+                _enterprise_catalog,
+                "_runtime",
+                wraps=_enterprise_catalog._runtime,
+            ) as bind:
+                self.assertEqual(len(await converter.tools("u", "a")), 1)
+                self.assertEqual(len(await converter.tools("u", "a")), 1)
+                self.assertEqual(await converter.tools("u", "other"), [])
+                self.assertEqual(bind.call_count, 1)
+                self.assertEqual(read.call_count, 1)
+                old_receipt = receipt.read_bytes()
+                receipt.unlink()
+                self.assertEqual(await converter.tools("u", "a"), [])
+                receipt.write_bytes(old_receipt)
+                self.assertEqual(len(await converter.tools("u", "a")), 1)
+                samples.clear()
+                self.assertEqual(await converter.tools("u", "a"), [])
+                samples["/items"] = {}
+                self.assertEqual(len(await converter.tools("u", "a")), 1)
+                replacement = spec.with_suffix(".new")
+                replacement.write_text(source.replace("/items", "/other"))
+                replacement.replace(spec)
+                self.assertEqual(await converter.tools("u", "a"), [])
+                self.assertEqual(read.call_count, 2)
 
     async def test_chat_import_scope_and_receipt_size(self) -> None:
         operations = {
@@ -251,11 +366,12 @@ class EnterpriseBusinessTest(IsolatedAsyncioTestCase):
             self.assertEqual(len(full["tools"]), 31)
 
     async def test_legacy_receipt_only_shortened_in_model_input(self) -> None:
+        from unittest.mock import AsyncMock
+
         from agentscope.app.middleware._enterprise_receipt import (
             EnterpriseReceiptMiddleware,
         )
-        from agentscope.message import AssistantMsg, ToolResultBlock, TextBlock
-        from unittest.mock import AsyncMock
+        from agentscope.message import AssistantMsg, TextBlock, ToolResultBlock
 
         raw = '{"kind": "api", "diagnostics": [], "tools": [' + "x" * 25000
         raw += (
@@ -300,8 +416,14 @@ class EnterpriseBusinessTest(IsolatedAsyncioTestCase):
                             "schema": {"type": "integer"},
                         }
                     ],
-                    "get": {"summary": "查询采购入库单", "responses": response},
-                    "delete": {"summary": "删除采购入库单", "responses": response},
+                    "get": {
+                        "summary": "查询采购入库单",
+                        "responses": response,
+                    },
+                    "delete": {
+                        "summary": "删除采购入库单",
+                        "responses": response,
+                    },
                 },
                 "/failedRead": {"get": {"responses": response}},
             },
@@ -342,7 +464,9 @@ class EnterpriseBusinessTest(IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result["kind"], "api")
                 status = {tool["label"]: tool for tool in result["tools"]}
-                self.assertEqual(status["查询采购入库单"]["status"], "registered")
+                self.assertEqual(
+                    status["查询采购入库单"]["status"], "registered"
+                )
                 self.assertEqual(status["删除采购入库单"]["status"], "pending")
                 self.assertEqual(
                     status["/failedRead"]["reason"],
@@ -523,7 +647,8 @@ paths:
             self.assertIn("/receipts", [r["route"] for r in result["tools"]])
 
     async def test_protected_http_routes_require_server_identity(self) -> None:
-        from fastapi import FastAPI, Depends
+        from fastapi import Depends, FastAPI
+
         from agentscope.app.deps import get_current_user_id
 
         with TemporaryDirectory() as directory:
@@ -602,6 +727,7 @@ paths:
         from unittest.mock import AsyncMock
 
         from fastapi import FastAPI
+
         from agentscope.app._router._enterprise_business import (
             enterprise_business_router,
         )
@@ -697,16 +823,18 @@ paths:
             app.state.extra_agent_tools = factory
             app.state.storage = SimpleNamespace(
                 get_agent=AsyncMock(
-                    side_effect=lambda u, a: object()
-                    if u == "owner" and a in {"purchasing", "other"}
-                    else None
+                    side_effect=lambda u, a: (
+                        object()
+                        if u == "owner" and a in {"purchasing", "other"}
+                        else None
+                    )
                 ),
                 get_session=AsyncMock(
-                    side_effect=lambda u, a, s: SimpleNamespace(
-                        state=AgentState()
+                    side_effect=lambda u, a, s: (
+                        SimpleNamespace(state=AgentState())
+                        if (u, a, s) == ("owner", "purchasing", "current")
+                        else None
                     )
-                    if (u, a, s) == ("owner", "purchasing", "current")
-                    else None
                 ),
             )
             path = "/agent/purchasing/enterprise-business/skills"

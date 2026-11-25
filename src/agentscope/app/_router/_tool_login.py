@@ -77,9 +77,9 @@ async def submit_tool_login(
     try:
         await manager.submit(scope, login_id, body["revision"], body["values"])
     except LoginRejected as exc:
-        raise HTTPException(400, str(exc)) from None
+        raise HTTPException(400, exc.detail()) from None
     except LoginFailed as exc:
-        raise HTTPException(422, str(exc)) from None
+        raise HTTPException(422, exc.detail()) from None
     except LoginConflict as exc:
         raise HTTPException(409, str(exc)) from None
     except LoginEnded as exc:

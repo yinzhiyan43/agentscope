@@ -102,6 +102,50 @@ def recipe():
 
 
 class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
+    async def test_static_header_key_requires_no_chat_login(self) -> None:
+        source = json.dumps(definition())
+        requests = []
+        client = httpx.AsyncClient
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                request.headers["X-Ticket"], "private-configured-key"
+            )
+            self.assertNotIn("Authorization", request.headers)
+            requests.append(request.url.path)
+            return httpx.Response(200, json={"count": 2})
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch(
+                "httpx.AsyncClient",
+                side_effect=lambda **kwargs: client(
+                    transport=httpx.MockTransport(respond), **kwargs
+                ),
+            ),
+        ):
+            root = Path(tmp)
+            spec = root / "spec.json"
+            spec.write_text(source)
+            api = EnterpriseReadAPI(
+                spec,
+                "https://service.test",
+                {"/reports/count": {}},
+                token="private-configured-key",
+            )
+            converter = EnterpriseBusiness(
+                root / "imports", read_apis={"owner": [api]}
+            )
+            result = await converter.convert(
+                "owner", "agent", source, business_scope="/reports/count"
+            )
+            self.assertEqual(result["tools"][0]["status"], "registered")
+            (tool,) = await converter.tools("owner", "agent")
+            await tool.call()
+            self.assertEqual(requests, ["/reports/count", "/reports/count"])
+            (receipt,) = (root / "imports").glob("*/*.json")
+            self.assertNotIn("private-configured-key", receipt.read_text())
+
     async def test_customer_form_and_chained_dependencies(self):
         doc = definition()
         # The first lookup exists only to feed the next lookup.
@@ -135,6 +179,10 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
                 return httpx.Response(200, json={"items": [{"key": "S1"}]})
             if path == "/session/start":
                 data = json.loads(request.content)
+                if data["pin"] == "incorrect-pin":
+                    return httpx.Response(
+                        401, json={"message": "Invalid credentials"}
+                    )
                 self.assertEqual(
                     data,
                     {"station": "S1", "pin": "private-input"},
@@ -218,6 +266,8 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
                     )
                 )
                 choice = await wait_form()
+                self.assertEqual(choice.step.title_key, "chooseTitle")
+                self.assertEqual(choice.step.submit_label_key, "continue")
                 (field,) = choice.step.fields
                 self.assertEqual(
                     (field.name, [o.label for o in field.options]),
@@ -231,6 +281,13 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
                     [(f.name, f.required) for f in form.step.fields],
                     [("pin", True), ("nonce", False)],
                 )
+                with self.assertRaises(LoginRejected) as rejected:
+                    await broker.submit(
+                        scope, form.id, form.revision, {"pin": "incorrect-pin"}
+                    )
+                self.assertEqual(rejected.exception.code, "rejected")
+                self.assertFalse(run.done())
+                self.assertEqual(await broker.pending_view(scope), form)
                 await broker.submit(
                     scope, form.id, 0, {"pin": "private-input"}
                 )

@@ -83,7 +83,11 @@ class ToolLoginTest(unittest.IsolatedAsyncioTestCase):
                 started.set()
                 await asyncio.Future()
             if values["password"] == "mistyped":
-                raise LoginRejected("Try again")
+                raise LoginRejected(
+                    "Try again",
+                    code="invalidField",
+                    params={"field": "password"},
+                )
             return LoginSuccess("private-session")
 
         async def wait_for_form(client: httpx.AsyncClient) -> str:
@@ -94,15 +98,19 @@ class ToolLoginTest(unittest.IsolatedAsyncioTestCase):
                         return form["id"]
                     await asyncio.sleep(0)
 
-        with tool_login_scope(*scope), patch.object(
-            bus,
-            "registry_set",
-            wraps=bus.registry_set,
-        ) as stored, patch.object(
-            bus,
-            "log_append",
-            wraps=bus.log_append,
-        ) as replayed:
+        with (
+            tool_login_scope(*scope),
+            patch.object(
+                bus,
+                "registry_set",
+                wraps=bus.registry_set,
+            ) as stored,
+            patch.object(
+                bus,
+                "log_append",
+                wraps=bus.log_append,
+            ) as replayed,
+        ):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://test",
@@ -144,9 +152,15 @@ class ToolLoginTest(unittest.IsolatedAsyncioTestCase):
                     1,
                 )
                 self.assertEqual((await submit("old-step")).status_code, 409)
+                rejected = await submit("mistyped", 1)
+                self.assertEqual(rejected.status_code, 400)
                 self.assertEqual(
-                    (await submit("mistyped", 1)).status_code,
-                    400,
+                    rejected.json()["detail"],
+                    {
+                        "code": "invalidField",
+                        "params": {"field": "password"},
+                        "message": "Try again",
+                    },
                 )
                 self.assertEqual(
                     (await submit("secret-fixture", 1)).status_code,

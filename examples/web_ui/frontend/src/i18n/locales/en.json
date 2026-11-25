@@ -260,6 +260,23 @@
 	},
 	"chat": {
 		"toolLogin": {
+			"enterprise": {
+				"authTitle": "API authentication",
+				"chooseTitle": "Select an authentication value",
+				"continue": "Continue",
+				"username": "Username",
+				"password": "Password",
+				"invalidField": "Enter a valid value for {{field}}.",
+				"lookupType": "A dependency returned a value with an unexpected type.",
+				"lookupPath": "A dependency returned an invalid path parameter.",
+				"lookupFailed": "Could not load options for {{field}} from {{route}}.",
+				"lookupEmpty": "{{route}} returned no options for {{field}}.",
+				"invalidInputs": "The authentication inputs do not match the interface definition.",
+				"rejected": "The service rejected these authentication inputs. Check them and try again.",
+				"missingCredential": "The service did not issue a credential. Check your authentication inputs.",
+				"unexpectedResponse": "The authentication response does not match the interface definition.",
+				"invalidCredential": "The service credential format is invalid."
+			},
 			"cancel": "Cancel operation",
 			"working": "Signing in…",
 			"submitError": "Could not submit the login form."

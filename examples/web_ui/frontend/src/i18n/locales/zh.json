@@ -259,6 +259,23 @@
 	},
 	"chat": {
 		"toolLogin": {
+			"enterprise": {
+				"authTitle": "接口认证",
+				"chooseTitle": "选择认证参数",
+				"continue": "继续",
+				"username": "用户名",
+				"password": "密码",
+				"invalidField": "请按接口要求填写 {{field}}。",
+				"lookupType": "上游返回值与依赖接口的参数类型不符。",
+				"lookupPath": "依赖接口返回了无效的路径参数。",
+				"lookupFailed": "无法从 {{route}} 读取 {{field}} 的选项。",
+				"lookupEmpty": "{{route}} 未返回 {{field}} 的可选值。",
+				"invalidInputs": "认证参数组合不符合接口定义。",
+				"rejected": "服务未接受这些认证参数，请核对后重试。",
+				"missingCredential": "服务未返回凭据，请核对认证参数。",
+				"unexpectedResponse": "认证服务的响应与接口定义不符。",
+				"invalidCredential": "服务凭据格式无效。"
+			},
 			"cancel": "取消操作",
 			"working": "正在登录…",
 			"submitError": "登录表单提交失败。"

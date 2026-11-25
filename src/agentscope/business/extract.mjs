@@ -13,7 +13,36 @@ const options = JSON.parse(optionsJSON ?? '{}');
 const modules = new Map();
 let functions;
 const hashes = {};
+const discoveryDependencies = new Map();
+const discoveryDependencyLimit = 12000;
+let reusableDiscovery = Boolean(options.trackDiscovery);
 let endpoint;
+
+function watchDiscovery(file) {
+  if (!reusableDiscovery) return;
+  const relative = path.relative(root, file);
+  if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return;
+  if (discoveryDependencies.has(relative)) return;
+  if (discoveryDependencies.size >= discoveryDependencyLimit) {
+    reusableDiscovery = false;
+    return;
+  }
+  try {
+    const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) {
+      reusableDiscovery = false;
+      return;
+    }
+    const stamp = stat
+      ? [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].map(String)
+      : null;
+    discoveryDependencies.set(relative, stamp);
+  } catch {
+    // A scan can still work when an optional import path cannot be inspected.
+    reusableDiscovery = false;
+  }
+  if (file !== root) watchDiscovery(path.dirname(file));
+}
 
 function fail(node, message) {
   const loc = evidence(node);
@@ -36,7 +65,10 @@ function localModule(from, importer) {
   while (aliasRoot !== root && path.basename(aliasRoot) !== 'src') aliasRoot = path.dirname(aliasRoot);
   const base = from.startsWith('@/') ? path.join(aliasRoot, from.slice(2)) : path.resolve(path.dirname(importer), from);
   const found = [base, ...['.ts', '.js', '.mjs', '/index.ts', '/index.js'].map(ext => base + ext)]
-    .find(candidate => fs.statSync(candidate, { throwIfNoEntry: false })?.isFile());
+    .find(candidate => {
+      watchDiscovery(candidate);
+      return fs.statSync(candidate, { throwIfNoEntry: false })?.isFile();
+    });
   if (!found) throw new Error('Missing local module ' + from);
   return load(found);
 }
@@ -57,12 +89,14 @@ function transportEvidence(from, importer, node) {
 }
 
 function load(file) {
+  watchDiscovery(file);
   const real = fs.realpathSync(file);
   const relative = path.relative(root, real);
   if (relative.startsWith('..' + path.sep) || relative === '..' || path.isAbsolute(relative)) {
     throw new Error('Import outside the selected source directory');
   }
   if (modules.has(relative)) return modules.get(relative);
+  watchDiscovery(real);
   const raw = fs.readFileSync(real, 'utf8');
   hashes[relative] = createHash('sha256').update(raw).digest('hex');
   let text = raw;
@@ -398,6 +432,7 @@ function discoverFile(file, actions, diagnostics) {
 }
 
 function discover(dir, actions, diagnostics) {
+  watchDiscovery(dir);
   const skip = new Set(['node_modules', 'dist', 'build', 'coverage', 'target', 'vendor']);
   for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
     if (options.discoveryLimit && discoveredFiles >= options.discoveryLimit) return;
@@ -436,6 +471,7 @@ try {
     console.log(JSON.stringify({
       actions, diagnostics,
       truncated: Boolean(options.discoveryLimit && discoveredFiles >= options.discoveryLimit),
+      ...(reusableDiscovery ? { dependencies: Object.fromEntries(discoveryDependencies) } : {}),
     }));
   } else {
     console.log(JSON.stringify(buildPlan(load(path.resolve(root, entryFile)), entryName)));

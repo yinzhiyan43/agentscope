@@ -3,12 +3,13 @@
 
 from typing import Any
 import json
+import os
 import sqlite3
 import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from agentscope.business import (
     EnterpriseBusiness,
@@ -189,8 +190,19 @@ class ConnectedSaveTest(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual(
             [tool.name for tool in tools], [registrar.name, *report["tools"]]
         )
+        read_file = Path.read_bytes
+        with patch.object(
+            Path, "read_bytes", autospec=True, side_effect=read_file
+        ) as reads:
+            await converter.tools("employee", "assistant")
+            paths_read = [call.args[0] for call in reads.call_args_list]
+            self.assertNotIn(self.spec, paths_read)
+            self.assertNotIn(self.root / "Ticket.vue", paths_read)
         self.assertEqual(await converter.tools("employee", "other"), [])
-        (self.root / "Ticket.vue").write_text("changed")
+        rule = self.root / "Ticket.vue"
+        stamp = rule.stat()
+        rule.write_text(rule.read_text().replace(".issue", ".other"))
+        os.utime(rule, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         latest = await converter.latest("employee", "assistant")
         self.assertEqual(
             next(

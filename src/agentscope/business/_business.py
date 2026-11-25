@@ -680,13 +680,20 @@ def as_tool(
     token: str | None = None,
     *,
     auth: httpx.Auth | None = None,
+    static_headers: dict[str, str] | None = None,
 ) -> FunctionTool:
     """Load a built definition for use in Toolkit(tools=[...])."""
-    validate_api_base_url(base_url, authenticated=bool(token or auth))
+    validate_api_base_url(
+        base_url,
+        authenticated=bool(token or auth or static_headers),
+    )
     op = artifact["operation"]
+    configured_headers = dict(static_headers or {})
 
     async def invoke(**inputs: Any) -> dict:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = dict(configured_headers)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         async with httpx.AsyncClient(
             timeout=15,
             follow_redirects=False,

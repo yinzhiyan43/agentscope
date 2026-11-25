@@ -3,6 +3,7 @@
 
 from ._business import as_tool, build, discover, preview
 from ._enterprise import EnterpriseBusiness, EnterpriseReadAPI
+from ._enterprise_config import EnterpriseLimits
 from ._registry import BusinessRegistry
 from ._save_operation import write_save_receipt
 from ._save_registry import SaveBusinessRegistry
@@ -13,6 +14,7 @@ __all__ = [
     "as_tool",
     "BusinessRegistry",
     "EnterpriseBusiness",
+    "EnterpriseLimits",
     "EnterpriseReadAPI",
     "RowActionSource",
     "RowDetailTools",

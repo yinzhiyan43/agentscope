@@ -5,12 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ...business._enterprise import (
-    MAX_INPUT,
     EnterpriseBusiness,
     EnterpriseSkillView,
     enterprise_skill_views,
 )
 from ...business._enterprise_auth import LoginRecipe
+from ...business._enterprise_config import MAX_INPUT
 from ...state import AgentState
 from .._types import AgentToolFactory
 from ..deps import get_current_user_id, get_extra_agent_tools, get_storage

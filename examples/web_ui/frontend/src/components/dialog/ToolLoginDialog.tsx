@@ -19,11 +19,14 @@ interface LoginView {
 	revision: number;
 	step: {
 		title: string;
+		title_key?: string | null;
 		description: string;
 		submit_label: string;
+		submit_label_key?: string | null;
 		fields: Array<{
 			name: string;
 			label: string;
+			label_key?: string | null;
 			kind: 'text' | 'secret';
 			required: boolean;
 			options?: Array<{ value: string; label: string }> | null;
@@ -89,6 +92,8 @@ function LoginForm({
 	const formId = useId();
 	const [pending, setPending] = useState(false);
 	const [error, setError] = useState('');
+	const label = (key: string | null | undefined, fallback: string) =>
+		key ? t('chat.toolLogin.enterprise.' + key, { defaultValue: fallback }) : fallback;
 
 	async function perform(method: 'POST' | 'DELETE', body?: unknown) {
 		if (pending) return;
@@ -105,7 +110,21 @@ function LoginForm({
 			refresh();
 		} catch (err) {
 			if (err instanceof ApiError && (err.status === 404 || err.status === 409)) refresh();
-			setError(err instanceof ApiError ? err.detail : t('chat.toolLogin.submitError'));
+			if (err instanceof ApiError) {
+				const data = err.data;
+				if (data && typeof data === 'object' && 'code' in data && typeof data.code === 'string') {
+					const params = 'params' in data ? data.params as Record<string, string> : {};
+					setError(t('chat.toolLogin.enterprise.' + data.code, {
+						field: params?.field,
+						route: params?.route,
+						defaultValue: err.detail,
+					}));
+				} else {
+					setError(err.detail);
+				}
+			} else {
+				setError(t('chat.toolLogin.submitError'));
+			}
 		} finally {
 			setPending(false);
 		}
@@ -127,7 +146,7 @@ function LoginForm({
 				onInteractOutside={(event) => event.preventDefault()}
 			>
 				<DialogHeader>
-					<DialogTitle>{view.step.title}</DialogTitle>
+					<DialogTitle>{label(view.step.title_key, view.step.title)}</DialogTitle>
 					<DialogDescription>{view.step.description}</DialogDescription>
 				</DialogHeader>
 				<form onSubmit={submit} autoComplete="off" className="grid gap-4">
@@ -135,7 +154,7 @@ function LoginForm({
 						const id = formId + '-' + index;
 						return (
 							<div key={field.name} className="grid gap-2">
-								<Label htmlFor={id}>{field.label}</Label>
+								<Label htmlFor={id}>{label(field.label_key, field.label)}</Label>
 								{field.options ? (
 									<select
 										id={id}
@@ -181,7 +200,7 @@ function LoginForm({
 							{t('chat.toolLogin.cancel')}
 						</Button>
 						<Button type="submit" disabled={pending}>
-							{pending ? t('chat.toolLogin.working') : view.step.submit_label}
+							{pending ? t('chat.toolLogin.working') : label(view.step.submit_label_key, view.step.submit_label)}
 						</Button>
 					</DialogFooter>
 				</form>

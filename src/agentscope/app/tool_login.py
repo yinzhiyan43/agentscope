@@ -7,11 +7,11 @@ import json
 import math
 import time
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
     Iterator,
     Mapping,
-    AsyncIterator,
 )
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -59,6 +59,7 @@ class LoginField(BaseModel):
 
     name: str = Field(min_length=1, max_length=80)
     label: str
+    label_key: str | None = None
     kind: Literal["text", "secret"] = "text"
     required: bool = True
     options: list[LoginOption] | None = None
@@ -71,6 +72,8 @@ class LoginStep(BaseModel):
     description: str
     submit_label: str
     fields: list[LoginField] = Field(max_length=12)
+    title_key: str | None = None
+    submit_label_key: str | None = None
 
 
 class LoginView(BaseModel):
@@ -88,7 +91,27 @@ class LoginSuccess:
     value: Any
 
 
-class LoginRejected(Exception):
+class LoginFormError(Exception):
+    """A safe login error with an optional translation key and parameters."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        code: str | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params or {}
+
+    def detail(self) -> dict | str:
+        if self.code is None:
+            return str(self)
+        return {"code": self.code, "params": self.params, "message": str(self)}
+
+
+class LoginRejected(LoginFormError):
     """A retryable, user-safe message supplied by the adapter."""
 
 
@@ -96,7 +119,7 @@ class LoginEnded(Exception):
     """The authentication request was cancelled, expired, or unavailable."""
 
 
-class LoginFailed(Exception):
+class LoginFailed(LoginFormError):
     """A permanent adapter error that should return control to the tool."""
 
 
@@ -227,7 +250,9 @@ class ToolLogin:
                     "Login cancelled. Stop the current operation.",
                 )
             if isinstance(result, LoginFailed):
-                raise LoginFailed(str(result))
+                raise LoginFailed(
+                    str(result), code=result.code, params=result.params
+                )
             return result.value
         except TimeoutError:
             if self._finish(key, pending, None):
@@ -349,6 +374,8 @@ class ToolLogin:
                 if isinstance(error, cls)
             )
             reply = {"error": kind, "message": str(error)}
+            if isinstance(error, LoginFormError) and error.code:
+                reply.update(code=error.code, params=error.params)
         except Exception:
             reply = {
                 "error": "LoginFailed",
@@ -407,7 +434,14 @@ class ToolLogin:
                 "The login worker did not respond in time.",
             ) from None
         if error := result.get("error"):
-            raise _RELAY_ERRORS[error](result["message"])
+            cls = _RELAY_ERRORS[error]
+            if issubclass(cls, LoginFormError) and result.get("code"):
+                raise cls(
+                    result["message"],
+                    code=result["code"],
+                    params=result.get("params"),
+                )
+            raise cls(result["message"])
 
     def _finish(
         self,
@@ -504,7 +538,13 @@ class ToolLogin:
                     completion.cancel()
                     await asyncio.gather(completion, return_exceptions=True)
             except LoginFailed as exc:
-                self._finish(key, pending, LoginFailed(str(exc)))
+                # Only a terminal failure completes the waiting future.
+                # LoginRejected leaves the same form available for a retry.
+                self._finish(
+                    key,
+                    pending,
+                    LoginFailed(str(exc), code=exc.code, params=exc.params),
+                )
                 raise
             if self._pending.get(key) is not pending:
                 raise LoginEnded("This login request has ended.")

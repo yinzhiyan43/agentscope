@@ -6,17 +6,21 @@ from typing import Any
 import asyncio
 import hashlib
 import json
+import random
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable, AsyncIterator
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import FunctionTool
 from agentscope.tool._business_search import PublishedBusinessTool
 
 from ._business import bind_operation, write_definition
+from ._enterprise_config import PUBLICATION_POLL_SECONDS
+from ._file_cache import FileCache, json_paths
 from ._save_operation import (
     ReadbackView,
     ReceiptId,
@@ -184,26 +188,39 @@ def _actions_for(plan: dict, inputs: dict) -> list[dict]:
     return actions
 
 
+_local_publication_locks: WeakValueDictionary = WeakValueDictionary()
+
+
 @asynccontextmanager
-async def _publication_lock(path: Path) -> AsyncIterator[None]:
+async def _publication_lock(
+    path: Path, *, poll_seconds: float = PUBLICATION_POLL_SECONDS
+) -> AsyncIterator[None]:
     """Serialize publication and use across workers sharing this directory.
 
+    Tasks in one loop queue on an async lock. Only the first waiter retries
+    SQLite, with backoff, if a different worker owns the publication.
     SQLite releases the write lock if the process exits. The separate pending
     checkpoint survives a crash after the first ERP write.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(
-        sqlite3.connect(path.with_suffix(".lock"), timeout=0),
-    ) as lock:
-        while True:
-            try:
-                lock.execute("BEGIN IMMEDIATE")
-                break
-            except sqlite3.OperationalError as error:
-                if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
-                    raise
-                await asyncio.sleep(0.05)
-        yield
+    local = _local_publication_locks.setdefault(
+        (asyncio.get_running_loop(), path.resolve()), asyncio.Lock()
+    )
+    async with local:
+        with closing(
+            sqlite3.connect(path.with_suffix(".lock"), timeout=0),
+        ) as lock:
+            delay = poll_seconds
+            while True:
+                try:
+                    lock.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as error:
+                    if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                        raise
+                    await asyncio.sleep(random.uniform(delay / 2, delay))
+                    delay = min(delay * 2, max(poll_seconds, 0.5))
+            yield
 
 
 _ACCEPTANCE_VERSION = 3
@@ -239,6 +256,13 @@ class SaveBusinessRegistry:
         self.tool_prefix = tool_prefix
         self.target_label = (target_label or "").strip()
         self.readback_view = readback_view
+        self._receipt_cache = FileCache(
+            lambda path: json.loads(path.read_bytes()),
+            max_bytes=32 * 1024 * 1024,
+        )
+        self._source_digests = FileCache(
+            lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        )
 
     @property
     def import_registrar_name(self) -> str:
@@ -254,8 +278,11 @@ class SaveBusinessRegistry:
     def accepted_routes(self, user_id: str, agent_id: str) -> dict[str, str]:
         """Return saves with current target and acceptance evidence."""
         routes = {}
-        for path in self._directory(user_id, agent_id).glob("*.json"):
-            record = json.loads(path.read_bytes())
+        for path in json_paths(self._directory(user_id, agent_id)):
+            try:
+                record = self._receipt_cache.get(path)
+            except FileNotFoundError:
+                continue
             if self._current(record):
                 plan = record["plan"]
                 routes[plan["saveRoute"]] = plan["saveTool"]
@@ -347,7 +374,7 @@ class SaveBusinessRegistry:
             ),
             *(
                 tool
-                for path in sorted(directory.glob("*.json"))
+                for path in json_paths(directory)
                 for tool in self._published_tools(path, routes)
             ),
         ]
@@ -367,11 +394,12 @@ class SaveBusinessRegistry:
 
     def _sources_current(self, plan: dict) -> bool:
         try:
-            return plan["apiSha256"] == hashlib.sha256(
-                self.openapi.read_bytes(),
-            ).hexdigest() and all(
-                self._source_hash(name) == digest
-                for name, digest in plan["ruleHashes"].items()
+            return (
+                plan["apiSha256"] == self._source_digests.get(self.openapi)
+                and all(
+                    self._source_hash(name) == digest
+                    for name, digest in plan["ruleHashes"].items()
+                )
             )
         except (OSError, ValueError):
             return False
@@ -380,12 +408,15 @@ class SaveBusinessRegistry:
         source = (self.source / name).resolve()
         if not source.is_relative_to(self.source):
             raise ValueError("规则来源超出绑定源码目录")
-        return hashlib.sha256(source.read_bytes()).hexdigest()
+        return self._source_digests.get(source)
 
     def _published_tools(
         self, path: Path, routes: set[str] | None = None
     ) -> list[FunctionTool]:
-        record = json.loads(path.read_bytes())
+        try:
+            record = self._receipt_cache.get(path)
+        except FileNotFoundError:
+            return []
         if routes is not None and record["plan"]["saveRoute"] not in routes:
             return []
         save, read = self._runtime(record["plan"], path)

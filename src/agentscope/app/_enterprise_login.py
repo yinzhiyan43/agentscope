@@ -13,6 +13,7 @@ import httpx
 from jsonschema import Draft202012Validator, FormatChecker
 
 from ..business._business import validate_api_base_url
+from ..business._enterprise_config import EnterpriseLimits
 from .tool_login import (
     LoginFailed,
     LoginField,
@@ -49,7 +50,11 @@ def _input(field: str, schema: dict, raw: str) -> Any:
         except ValueError:
             pass
     if not _checked(schema, value):
-        raise LoginRejected(f"请按接口要求填写 {field}。")
+        raise LoginRejected(
+            f"Enter a valid value for {field}.",
+            code="invalidField",
+            params={"field": field},
+        )
     return value
 
 
@@ -61,8 +66,15 @@ async def _login(
     if not login:
         fields = (
             [
-                LoginField(name="username", label="Username"),
-                LoginField(name="password", label="Password", kind="secret"),
+                LoginField(
+                    name="username", label="Username", label_key="username"
+                ),
+                LoginField(
+                    name="password",
+                    label="Password",
+                    label_key="password",
+                    kind="secret",
+                ),
             ]
             if mode == "basic"
             else [
@@ -88,9 +100,11 @@ async def _login(
         return await broker.request(
             service,
             LoginStep(
-                title="接口认证",
+                title="API authentication",
+                title_key="authTitle",
                 description=base,
-                submit_label="继续",
+                submit_label="Continue",
+                submit_label_key="continue",
                 fields=fields,
             ),
             direct,
@@ -140,9 +154,11 @@ async def _login(
             result = await broker.request(
                 service,
                 LoginStep(
-                    title="接口认证",
+                    title="API authentication",
+                    title_key="authTitle",
                     description=destination,
-                    submit_label="继续",
+                    submit_label="Continue",
+                    submit_label_key="continue",
                     fields=fields,
                 ),
                 complete,
@@ -170,7 +186,7 @@ async def _login(
             if missing:
                 await collect(
                     missing,
-                    "查询选项 · GET " + base + dep["route"],
+                    "GET " + base + dep["route"],
                     lookup=True,
                 )
             route, query = dep["route"], {}
@@ -178,7 +194,10 @@ async def _login(
                 value = payload[source]
                 item = dep["params"][param]
                 if not _checked(item["schema"], value):
-                    raise LoginFailed("上游返回值与依赖接口的参数类型不符。")
+                    raise LoginFailed(
+                        "A dependency returned a value with an unexpected type.",
+                        code="lookupType",
+                    )
                 if item["in"] == "path":
                     segment = str(value)
                     if (
@@ -186,7 +205,10 @@ async def _login(
                         or segment in (".", "..")
                         or any(c in segment for c in "/\\%")
                     ):
-                        raise LoginFailed("依赖接口返回了无效的路径参数。")
+                        raise LoginFailed(
+                            "A dependency returned an invalid path parameter.",
+                            code="lookupPath",
+                        )
                     route = route.replace(
                         "{" + param + "}", quote(segment, safe="")
                     )
@@ -226,10 +248,16 @@ async def _login(
                 TypeError,
             ):
                 raise LoginFailed(
-                    f"无法从 {dep['route']} 解析 {name} 的选项。"
+                    f"Could not load options for {name} from {dep['route']}.",
+                    code="lookupFailed",
+                    params={"route": dep["route"], "field": name},
                 ) from None
             if not options:
-                raise LoginFailed(f"{dep['route']} 未返回 {name} 的可选值。")
+                raise LoginFailed(
+                    f"{dep['route']} returned no options for {name}.",
+                    code="lookupEmpty",
+                    params={"route": dep["route"], "field": name},
+                )
             index = 0
             if len(options) > 1:
 
@@ -241,9 +269,11 @@ async def _login(
                 index = await broker.request(
                     service,
                     LoginStep(
-                        title="选择认证参数",
+                        title="Select an authentication value",
+                        title_key="chooseTitle",
                         description=base + route,
-                        submit_label="继续",
+                        submit_label="Continue",
+                        submit_label_key="continue",
                         fields=[
                             LoginField(
                                 name=name,
@@ -259,14 +289,18 @@ async def _login(
         async def exchange(body: dict) -> str:
             body = {key: value for key, value in body.items() if key in props}
             if not _checked(schema, body):
-                raise LoginRejected("认证参数组合不符合接口定义。")
+                raise LoginRejected(
+                    "The authentication inputs do not match the interface definition.",
+                    code="invalidInputs",
+                )
             try:
                 response = await client.post(
                     login["route"].lstrip("/"), json=body
                 )
                 if response.status_code in (400, 401, 403, 422):
                     raise LoginRejected(
-                        "服务未接受这些认证参数，请核对后重试。"
+                        "The service rejected these authentication inputs. Check them and try again.",
+                        code="rejected",
                     )
                 response.raise_for_status()
                 try:
@@ -274,10 +308,16 @@ async def _login(
                 except (IndexError, TypeError, KeyError):
                     value = None
                 if not isinstance(value, str) or not value:
-                    raise LoginRejected("服务未返回凭据，请核对认证参数。")
+                    raise LoginRejected(
+                        "The service did not issue a credential. Check your authentication inputs.",
+                        code="missingCredential",
+                    )
                 return _header_value(value, mode)
             except (httpx.HTTPError, ValueError):
-                raise LoginFailed("认证服务的响应与接口定义不符。") from None
+                raise LoginFailed(
+                    "The authentication response does not match the interface definition.",
+                    code="unexpectedResponse",
+                ) from None
 
         names = [
             name
@@ -296,7 +336,10 @@ def _header_value(value: str, mode: str) -> str:
         or value != value.strip()
         or not value
     ):
-        raise LoginRejected("服务凭据格式无效。")
+        raise LoginRejected(
+            "The service credential format is invalid.",
+            code="invalidCredential",
+        )
     return "Bearer " + value if mode == "bearer" else value
 
 
@@ -309,8 +352,14 @@ class _Challenge:
 class EnterpriseLogin:
     """Keep issued credentials in memory only, scoped to the chat and contract."""
 
-    def __init__(self, broker: ToolLogin) -> None:
+    def __init__(
+        self,
+        broker: ToolLogin,
+        *,
+        max_cached_credentials: int = EnterpriseLimits.max_cached_credentials,
+    ) -> None:
         self.broker = broker
+        self._max_cached_credentials = max_cached_credentials
         self._headers: OrderedDict[tuple, str] = OrderedDict()
         self._pending: dict[tuple, _Challenge] = {}
 
@@ -329,7 +378,7 @@ class EnterpriseLogin:
         try:
             value = await asyncio.shield(challenge.task)
             self._headers[key] = value
-            if len(self._headers) > 256:
+            if len(self._headers) > self._max_cached_credentials:
                 self._headers.popitem(last=False)
             return value
         finally:

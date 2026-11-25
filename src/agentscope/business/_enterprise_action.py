@@ -17,6 +17,8 @@ from agentscope.state import AgentState
 from agentscope.tool._business_search import PublishedBusinessTool
 
 from ._business import definition_digest, validate, write_definition
+from ._enterprise_config import PUBLICATION_POLL_SECONDS
+from ._enterprise_diagnostics import report_failure
 from ._save_registry import _publication_lock
 
 Scalar = str | int | float | bool
@@ -136,6 +138,14 @@ class ActionBlocked(ValueError):
     def __init__(self, reason: str, step: str | None = None) -> None:
         super().__init__(reason)
         self.step = step
+        self.code = reason
+        self.diagnostic: dict | None = None
+
+    def with_cause(self, stage: str, error: Exception) -> "ActionBlocked":
+        self.diagnostic = report_failure(
+            self.code, stage, error, step=self.step
+        )
+        return self
 
 
 def _field(value: Any, pointer: str) -> Any:
@@ -308,6 +318,9 @@ def action_view(record: dict, blocked: ActionBlocked | None = None) -> dict:
     }
     if record.get("missing_inputs"):
         view["missing_inputs"] = record["missing_inputs"]
+    diagnostic = blocked.diagnostic if blocked else record.get("diagnostic")
+    if diagnostic:
+        view["diagnostic"] = diagnostic
     return view
 
 
@@ -320,6 +333,7 @@ async def verify_action(
     state: AgentState,
     *,
     draft: dict | None = None,
+    poll_seconds: float = PUBLICATION_POLL_SECONDS,
 ) -> dict:
     """Atomic writes track each successful GET. The lock is released on process exit."""
     from ..app.tool_login import LoginEnded, LoginFailed
@@ -327,7 +341,7 @@ async def verify_action(
     if draft is None and not path.is_file():
         raise ValueError("No such action for this Agent.")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    async with _publication_lock(path):
+    async with _publication_lock(path, poll_seconds=poll_seconds):
         previous = json.loads(path.read_bytes()) if path.is_file() else None
         if previous is None and draft is None:
             raise ValueError("No such action for this Agent.")
@@ -342,6 +356,7 @@ async def verify_action(
         past = previous["passed"] if previous else []
         needed = plan.projections()
         record.pop("missing_inputs", None)
+        record.pop("diagnostic", None)
         if previous is None:
             record.update(
                 status="pending", reason=None, passed=[], revisions=[]
@@ -360,6 +375,7 @@ async def verify_action(
                 and previous["sample"] == supplied
                 else [],
                 blocked_step=exc.step,
+                diagnostic=exc.diagnostic,
                 revisions=[],
             )
             write_definition(path, record)
@@ -439,23 +455,29 @@ async def verify_action(
                     state,
                     verifying=True,
                 )
-            except (LoginEnded, LoginFailed):
-                record["reason"] = "authentication_required"
-            except ActionBlocked as exc:
-                record["reason"] = str(exc)
-            except httpx.HTTPStatusError as exc:
-                record["reason"] = f"upstream_http_{exc.response.status_code}"
             except (
-                httpx.HTTPError,
-                KeyError,
-                TypeError,
+                LoginEnded,
+                LoginFailed,
                 ValueError,
+                httpx.HTTPError,
                 OSError,
                 subprocess.TimeoutExpired,
-            ):
-                record["reason"] = "verification_failed"
-            if record["reason"]:
-                record["blocked_step"] = step.key
+            ) as exc:
+                if isinstance(exc, ActionBlocked):
+                    code = exc.code
+                elif isinstance(exc, (LoginEnded, LoginFailed)):
+                    code = "authentication_required"
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    code = f"upstream_http_{exc.response.status_code}"
+                else:
+                    code = "verification_failed"
+                record.update(
+                    reason=code,
+                    blocked_step=step.key,
+                    diagnostic=report_failure(
+                        code, "action_probe", exc, step=step.key
+                    ),
+                )
                 write_definition(path, record)
                 return action_view(record)
             outputs[step.key] = values
@@ -473,7 +495,9 @@ async def verify_action(
                     )
         except ActionBlocked as exc:
             record.update(
-                reason=str(exc), blocked_step=exc.step or plan.steps[0].key
+                reason=exc.code,
+                blocked_step=exc.step or plan.steps[0].key,
+                diagnostic=exc.diagnostic,
             )
             write_definition(path, record)
             return action_view(record)

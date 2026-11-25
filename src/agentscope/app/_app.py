@@ -362,7 +362,10 @@ def create_app(
     )
     app.state.enterprise_business = enterprise_business
     tool_login = tool_login or ToolLogin(message_bus)
-    enterprise_business.login = EnterpriseLogin(tool_login)
+    enterprise_business.login = EnterpriseLogin(
+        tool_login,
+        max_cached_credentials=enterprise_business.limits.max_cached_credentials,
+    )
 
     async def agent_tools(
         user_id: str,

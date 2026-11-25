@@ -184,6 +184,18 @@ class EnterpriseActionTest(IsolatedAsyncioTestCase):
         self.assertEqual(
             (result["completed"], result["reason"]), (1, "upstream_http_503")
         )
+        self.assertEqual(
+            result["diagnostic"],
+            {
+                "code": "upstream_http_503",
+                "context": {
+                    "stage": "action_probe",
+                    "error_type": "HTTPStatusError",
+                    "http_status": 503,
+                    "step": "detail",
+                },
+            },
+        )
         self.mode = "ok"
         results = await asyncio.gather(
             *(
@@ -194,6 +206,7 @@ class EnterpriseActionTest(IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(all(r["status"] == "registered" for r in results))
+        self.assertTrue(all("diagnostic" not in r for r in results))
         self.assertEqual(
             self.sent,
             ["https://example.test/v1/find?code=A"]
