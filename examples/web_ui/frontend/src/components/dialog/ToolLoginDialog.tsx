@@ -27,8 +27,10 @@ interface LoginView {
 			name: string;
 			label: string;
 			label_key?: string | null;
-			kind: 'text' | 'secret';
+			kind: 'text' | 'secret' | 'one-time-code';
 			required: boolean;
+			suggestions?: string[] | null;
+			agreement?: string | null;
 			options?: Array<{ value: string; label: string }> | null;
 		}>;
 	};
@@ -149,13 +151,22 @@ function LoginForm({
 					<DialogTitle>{label(view.step.title_key, view.step.title)}</DialogTitle>
 					<DialogDescription>{view.step.description}</DialogDescription>
 				</DialogHeader>
-				<form onSubmit={submit} autoComplete="off" className="grid gap-4">
+				<form onSubmit={submit} autoComplete="off" className="grid max-h-[65dvh] gap-4 overflow-y-auto">
 					{view.step.fields.map((field, index) => {
 						const id = formId + '-' + index;
 						return (
 							<div key={field.name} className="grid gap-2">
 								<Label htmlFor={id}>{label(field.label_key, field.label)}</Label>
-								{field.options ? (
+								{field.agreement ? (
+									<>
+										<details>
+											<summary>查看完整协议</summary>
+											<div className="max-h-48 overflow-y-auto whitespace-pre-wrap">{field.agreement}</div>
+										</details>
+										<input id={id} type="checkbox" name={field.name} value="yes"
+											required={field.required} disabled={pending} />
+									</>
+								) : field.options ? (
 									<select
 										id={id}
 										name={field.name}
@@ -175,12 +186,18 @@ function LoginForm({
 									<Input
 										id={id}
 										name={field.name}
-										type={field.kind === 'secret' ? 'password' : 'text'}
-										autoComplete="off"
+										list={field.suggestions?.length ? id + '-options' : undefined}
+										type={field.kind === 'text' ? 'text' : 'password'}
+										autoComplete={field.kind === 'one-time-code' ? 'one-time-code' : 'off'}
 										required={field.required}
 										disabled={pending}
 										maxLength={4096}
 									/>
+								)}
+								{Boolean(field.suggestions?.length) && (
+									<datalist id={id + '-options'}>
+										{field.suggestions?.map((value) => <option key={value} value={value} />)}
+									</datalist>
 								)}
 							</div>
 						);

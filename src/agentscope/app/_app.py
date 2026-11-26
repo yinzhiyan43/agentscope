@@ -40,7 +40,7 @@ from ._router import (
 from ._router._tool_login import tool_login_router
 from ._router._enterprise_business import enterprise_business_router
 from .tool_login import ToolLogin
-from ._enterprise_login import EnterpriseLogin
+from ._enterprise_login import EnterpriseLogin, EnterpriseLoginAdapter
 from ._types import (
     AgentMiddlewareFactory,
     AgentToolFactory,
@@ -139,6 +139,7 @@ def create_app(
     extra_agent_middlewares: AgentMiddlewareFactory | None = None,
     extra_agent_tools: AgentToolFactory | None = None,
     enterprise_business: EnterpriseBusiness | None = None,
+    enterprise_login_adapters: dict[str, EnterpriseLoginAdapter] | None = None,
     tool_login: ToolLogin | None = None,
     tool_offload_timeout_secs: float | None = 10.0,
     custom_subagent_templates: list[SubAgentTemplate] | None = None,
@@ -300,6 +301,9 @@ def create_app(
             availability depends on the caller (per-tenant integrations,
             user-specific credentials).  The returned tools are added to
             the workspace-derived tools in the toolkit's ``"basic"`` group.
+        enterprise_login_adapters (dict, optional):
+            Trusted interactive login callbacks keyed by the host read API's
+            login_adapter setting.
         enterprise_business (`EnterpriseBusiness | None`, optional):
             Agent-scoped storage and trusted source/API bindings for chat
             imports. Defaults to the deployment's enterprise business config.
@@ -377,6 +381,7 @@ def create_app(
     tool_login = tool_login or ToolLogin(message_bus)
     enterprise_business.login = EnterpriseLogin(
         tool_login,
+        adapters=enterprise_login_adapters,
         max_cached_credentials=enterprise_business.limits.max_cached_credentials,
     )
 

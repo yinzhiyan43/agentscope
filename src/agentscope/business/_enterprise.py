@@ -316,6 +316,7 @@ class EnterpriseBusiness:
                     api.key,
                     api.success,
                     record["authentication"],
+                    *([api.login_adapter] if api.login_adapter else []),
                     sample,
                     _digest(api.token),
                 ]
@@ -403,6 +404,8 @@ class EnterpriseBusiness:
         offset: int,
         inventory_id: str = "",
         catalog: dict | None = None,
+        *,
+        state: AgentState | None = None,
     ) -> dict:
         if offset < 0:
             raise ValueError("Expected a nonnegative offset.")
@@ -421,6 +424,22 @@ class EnterpriseBusiness:
         records = [json.loads(path.read_bytes()) for path in paths]
         if inventory_id:
             records = [r for r in records if r["inventory_id"] == inventory_id]
+        if state is not None:
+            denied = {
+                name
+                for name, rules in state.permission_context.deny_rules.items()
+                if any(not rule.rule_content for rule in rules)
+            }
+            records = [
+                record
+                for record in records
+                if record.get("visible") is not False
+                and "business_action_" + record["id"][:32] not in denied
+                and all(
+                    step["operation"] not in denied
+                    for step in record["plan"]["steps"]
+                )
+            ]
         catalog = (
             self.compiler.catalog(user_id)
             if catalog is None and records
@@ -848,6 +867,7 @@ class EnterpriseBusiness:
                             api.key,
                             sorted(api.samples),
                             api.success,
+                            api.login_adapter,
                             _digest(api.token),
                         )
                         for api in entry["reads"]

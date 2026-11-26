@@ -59,7 +59,10 @@ async def run(directory: Path, stack: ExitStack) -> None:
             if len(fixture.rows) == 2 and fixture.calls:
                 fixture.rows.insert(
                     0,
-                    dict(fixture.rows[0], id=3, ticketKey="T3"),
+                    dict(
+                        fixture.rows[0], id=3, ticketKey="T3",
+                        supplierName="供应商 3",
+                    ),
                 )
             return await read(owner, limit)
 
@@ -138,6 +141,7 @@ async def run(directory: Path, stack: ExitStack) -> None:
                             "id": n,
                             "ticketKey": f"T{n}",
                             "billNo": "同号",
+                            "supplierName": f"供应商 {n}",
                             "subject": "同一工单",
                             "details": [f"detail-{n}"],
                         }
@@ -181,7 +185,7 @@ async def run(directory: Path, stack: ExitStack) -> None:
                 if session.startswith("purchase"):
                     expected = ["/api/purchase/order/page"] * 2 + [
                         "/api/purchase/order/2",
-                    ] * 2
+                    ] * 2 + ["/api/purchase/order/1"]
                 if fixture.calls != expected:
                     raise AssertionError((session, fixture.calls, expected))
         finally:

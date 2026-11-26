@@ -559,9 +559,8 @@ function ASMessageBubbleComponent({ message, onCardReply, cardDisabled }: Messag
 						),
 					)}
 				{message.role === 'assistant' &&
-					onCardReply &&
 					message.content.map((block) =>
-						block.type === 'tool_result' && block.name.startsWith('query_recent_') ? (
+						block.type === 'tool_result' ? (
 							<RowResultCard
 								key={block.id}
 								messageId={message.id}

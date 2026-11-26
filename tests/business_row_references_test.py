@@ -15,7 +15,13 @@ from utils import MockModel
 
 from agentscope.agent import Agent, ContextConfig
 from agentscope.app.middleware._row_card import RowCardMiddleware
-from agentscope.business import RowActionSource, RowDetailTools, RowScope
+from agentscope.business import (
+    ListColumn,
+    ListLayout,
+    RowActionSource,
+    RowDetailTools,
+    RowScope,
+)
 from agentscope.message import TextBlock, ToolCallBlock, UserMsg
 from agentscope.model import ChatResponse
 from agentscope.tool import Toolkit
@@ -106,6 +112,9 @@ class BusinessRowReferencesTest(IsolatedAsyncioTestCase):
 
             def send(req: httpx.Request) -> httpx.Response:
                 self.assertEqual(req.method, "GET")
+                if "/system/" in req.url.path:
+                    data = {} if req.url.path.endswith("/all") else []
+                    return httpx.Response(200, json={"code": 200, "data": data})
                 self.calls.append(req.url.path)
                 if req.url.path.endswith("/page"):
                     limit = int(req.url.params["size"])
@@ -205,6 +214,118 @@ class BusinessRowReferencesTest(IsolatedAsyncioTestCase):
                 self.assertIn(expected, opened.values())
                 self.assertEqual(self.calls[-1], expected)
                 self.assertEqual(len(self.calls), 3)
+
+    def test_read_only_layout_projects_ordered_visible_cells(self) -> None:
+        """A plain result uses the same contract without a detail route."""
+        layout = ListLayout(
+            "工单",
+            (ListColumn("priority", "优先级"), ListColumn("subject", "主题")),
+        )
+        result = layout.present(
+            [{"subject": "待处理", "priority": 0, "internalNote": "private"}], 1
+        )
+        self.assertEqual(list(result["records"][0]), ["priority", "subject"])
+        self.assertEqual(result["records"], [{"priority": 0, "subject": "待处理"}])
+        self.assertNotIn("list_ref", result)
+
+    async def test_text_matches_current_purchase_list_without_a_click(self) -> None:
+        self.rows = [
+            {"id": 41, "billNo": "A-01", "supplierName": "甲厂", "details": ["first"]},
+            {"id": 29, "billNo": "A-02", "supplierName": "甲厂", "details": ["original"]},
+        ]
+        lookup = AsyncMock(return_value=None)
+        tools = self.host(self.purchase).tools()
+        model = MockModel(context_size=32000)
+        agent = Agent(
+            name="reader",
+            system_prompt="展示业务列表并按用户条件查找详情。",
+            model=model,
+            toolkit=Toolkit(tools=tools),
+            middlewares=[RowCardMiddleware(lookup)],
+            context_config=ContextConfig(compression_tool_enabled=False),
+        )
+        model.set_responses([
+            ChatResponse(content=[ToolCallBlock(
+                id="list-purchase",
+                name=tools[1].name,
+                input='{"limit":2}',
+            )], is_last=True),
+            ChatResponse(content=[TextBlock(text="已查询")], is_last=True),
+        ])
+        await agent.reply(UserMsg("alice", "查看刚才列表"))
+        self.rows.reverse()
+        model.set_responses([])
+
+        async def ask(text: str) -> str:
+            await agent.reply(UserMsg("alice", text))
+            return agent.state.get_reply_message(agent.name).get_text_content()
+
+        self.assertIn("2 条记录匹配", await ask("获取供应商是甲厂的详情"))
+        self.assertEqual(self.calls, ["/api/purchase/order/page"])
+        self.assertIn("original", await ask("入库单号=A-02"))
+        self.assertEqual(self.calls[-1], "/api/purchase/order/29")
+        self.assertIn("没有精确匹配", await ask("查看入库单号为 A 的详情"))
+        self.assertIn("可见列", await ask("获取 id=29 的详情"))
+        self.assertEqual(len(self.calls), 2)
+        lookup.assert_not_awaited()
+
+        model.set_responses([
+            ChatResponse(
+                content=[ToolCallBlock(
+                    id="natural-lookup",
+                    name=tools[2].name,
+                    input=json.dumps({"conditions": {"供应商": "甲厂"}}),
+                )],
+                is_last=True,
+            )
+        ])
+        self.assertIn("请补充可见列条件", await ask("给我看看甲厂那张单据"))
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_field_matching_uses_saved_visible_values(self) -> None:
+        self.rows = [
+            {"id": 41, "billNo": "001", "status": True, "details": ["first"]},
+            {"id": 29, "billNo": "1", "status": False, "details": ["second"]},
+        ]
+        host = self.host(self.purchase)
+        layout = ListLayout(
+            "采购入库单",
+            (ListColumn("billNo", "入库单号"), ListColumn("status", "状态")),
+        )
+        shown = await host.present_page(
+            self.viewer, {"records": self.rows, "total": 2}, layout=layout
+        )
+        ref = shown["list_ref"]
+        self.assertEqual(
+            (await host.open_row(ref, conditions={"id": "29"}))["row_match"],
+            "invalid_column",
+        )
+        self.assertEqual(
+            (await host.open_row(ref, conditions={"入库单号": "01"}))["row_match"],
+            "not_found",
+        )
+        self.assertFalse(self.calls)
+        result = await host.open_row(
+            conditions={"billNo": "1", "状态": "false"}
+        )
+        self.assertEqual(result["detail"]["details"], ["second"])
+        self.assertEqual(self.calls, ["/api/purchase/order/29"])
+
+        # Previously saved snapshots still support the original row contract.
+        with closing(sqlite3.connect(self.database)) as connection:
+            (raw,) = connection.execute(
+                "SELECT args FROM row_lists WHERE ref=?", (ref,)
+            ).fetchone()
+            connection.execute(
+                "UPDATE row_lists SET args=? WHERE ref=?",
+                (json.dumps(json.loads(raw)["args"]), ref),
+            )
+            connection.commit()
+        self.assertEqual(
+            (await host.open_row(ref, conditions={"billNo": "001"}))["row_match"],
+            "refresh_required",
+        )
+        self.assertEqual((await host.open_row(ref, 1))["details"], ["first"])
 
     async def test_agent_followup_uses_previous_tool_result(self) -> None:
         """Exercise the registered tools and the previous turn's actual ref."""

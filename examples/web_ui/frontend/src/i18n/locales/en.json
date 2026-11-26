@@ -262,6 +262,8 @@
 		"toolLogin": {
 			"enterprise": {
 				"authTitle": "API authentication",
+				"requestCode": "Request verification code",
+				"renewCode": "Verification code expired. Request a new code.",
 				"chooseTitle": "Select an authentication value",
 				"continue": "Continue",
 				"username": "Username",
@@ -846,10 +848,22 @@
 			"business": "Enterprise business skills",
 			"workspaceSkills": "Workspace skills",
 			"actions": { "query": "Query", "save": "Save", "readback": "Readback" },
-			"refreshBusiness": "Refresh enterprise business skills",
+			"refreshBusiness": "Refresh enterprise business",
 			"businessLoadError": "Could not load enterprise business skills. Refresh to try again.",
 			"businessAuthError": "Verify your account to view this agent’s enterprise business skills.",
 			"businessEmpty": "Mention @企业业务 in chat to discuss or register a business function.",
+			"businessActions": {
+				"title": "Enterprise business actions",
+				"pending": "Pending verification",
+				"registered": "Verified",
+				"progress": "{{completed}} / {{total}} steps",
+				"resume": "Resume verification",
+				"resuming": "Verifying…",
+				"stillPending": "Verification is still pending. The progress has been updated.",
+				"resumeError": "Could not resume verification. Try again.",
+				"loadError": "Could not load enterprise business actions. Refresh to try again.",
+				"loadMore": "Load more actions"
+			},
 			"title": "Skills",
 			"description": "Skills available to this agent.",
 			"searchPlaceholder": "Search this agent’s skills",

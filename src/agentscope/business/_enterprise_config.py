@@ -62,10 +62,14 @@ class EnterpriseReadAPI:
     samples: dict[str, dict]
     token: str | None = field(default=None, repr=False)
     success: dict | None = None
+    login_adapter: str | None = None
 
     @property
     def key(self) -> str:
-        return definition_digest([str(self.document), self.base_url])
+        parts = [str(self.document), self.base_url]
+        if self.login_adapter:
+            parts.append(self.login_adapter)
+        return definition_digest(parts)
 
 
 def load_enterprise_config() -> dict:
@@ -96,6 +100,7 @@ def load_enterprise_config() -> dict:
                     if api.get("token_env")
                     else None,
                     api.get("success"),
+                    api.get("login_adapter"),
                 )
                 for api in apis
             ]

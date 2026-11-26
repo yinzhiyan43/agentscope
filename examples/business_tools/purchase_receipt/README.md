@@ -115,3 +115,24 @@ node "$CASE/capture.cjs" --client "$ERP/frontend-user" --chromium "$CHROMIUM" \
 ### 常驻聊天服务中的行引用
 
 已使用 `PurchaseAuthentication` 的宿主，在构建聊天服务时用 `with_purchase_rows(previous_factory, purchase_auth, source, private_db, read_permission)` 包装原来的会话工具工厂。它只为原本拥有采购列表工具的会话增加详情导航。列表继续使用同一次已登录的 ERP 分页响应，保留原客户端登录验收流程。详情沿用该会话的私密登录，核对当前账套、账号和采购页面权限后按隐藏键读取。SQLite 文件应放在宿主私有目录中，并供同一服务的工作进程共享。
+
+采购适配器使用同一 ERP 账号读取字段权限、已保存的列配置、自定义字段和字段说明。其他业务适配器也可根据各自客户端的规则生成有序的 `ListLayout`，用 `present(records, total)` 返回列表，或传给 `RowDetailTools.present_page(..., layout=layout)` 保留按原行打开详情的能力。可见列以外的数据在服务端裁剪。
+
+### 企业接口认证
+
+通用项目可在注册业务时提供 `authentication`。其中 `lookups` 声明公开选项接口和依赖顺序，`filters` 将候选记录的 JSON Pointer 映射到已选字段，`identity` 指定登录后用于核对身份的受保护 GET 和字段映射，`expired` 指定服务返回的会话过期条件。例如一个使用工作站账号的服务可以声明：
+
+```json
+{
+  "route": "/sessions",
+  "credential": "/session/key",
+  "lookups": {
+    "group": {"route": "/groups", "value": "/id"},
+    "station": {"route": "/stations", "value": "/key", "filters": {"/group": "group"}}
+  },
+  "identity": {"route": "/me", "fields": {"station": "/station/key"}},
+  "expired": [{"status": 200, "fields": {"error.name": "ticket-ended"}}]
+}
+```
+
+客户已有地区字典、服务协议等专用登录流程时，宿主可以在 `create_app(..., enterprise_login_adapters={"purchase-client": login_adapter})` 中注册可信回调，并在对应的 `read_apis` 连接中设置 `"login_adapter": "purchase-client"`。本示例的 `login_adapter` 位于同目录的 `login.py`，地区数据和协议随示例提供。适配器仅绑定到指定连接，项目名称和文档标题不参与选择。

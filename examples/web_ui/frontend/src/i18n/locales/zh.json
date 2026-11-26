@@ -261,6 +261,8 @@
 		"toolLogin": {
 			"enterprise": {
 				"authTitle": "接口认证",
+				"requestCode": "获取验证码",
+				"renewCode": "验证码已失效，请重新获取",
 				"chooseTitle": "选择认证参数",
 				"continue": "继续",
 				"username": "用户名",
@@ -845,10 +847,22 @@
 			"business": "企业业务技能",
 			"workspaceSkills": "工作区技能",
 			"actions": { "query": "查询", "save": "保存", "readback": "回查" },
-			"refreshBusiness": "刷新企业业务技能",
+			"refreshBusiness": "刷新企业业务",
 			"businessLoadError": "企业业务技能加载失败，请刷新重试。",
 			"businessAuthError": "请先验证账号，再查看当前智能体的企业业务技能。",
 			"businessEmpty": "可在聊天中通过 @企业业务 讨论或注册业务功能。",
+			"businessActions": {
+				"title": "企业业务动作",
+				"pending": "待验收",
+				"registered": "验收通过",
+				"progress": "{{completed}} / {{total}} 步",
+				"resume": "继续验证",
+				"resuming": "验证中…",
+				"stillPending": "验收尚未完成，列表已更新进度。",
+				"resumeError": "无法继续验证，请重试。",
+				"loadError": "企业业务动作加载失败，请刷新重试。",
+				"loadMore": "加载更多动作"
+			},
 			"title": "技能",
 			"description": "当前智能体可用的技能。",
 			"searchPlaceholder": "搜索当前智能体的技能",

@@ -600,7 +600,13 @@ class EnterpriseCompiler:
                     elif (
                         authentication
                         and method == "post"
-                        and route == authentication.route
+                        and (
+                            route == authentication.route
+                            or (
+                                authentication.challenge
+                                and route == authentication.challenge.route
+                            )
+                        )
                     ):
                         record["reason"] = "authentication_endpoint"
                     records.append(record)

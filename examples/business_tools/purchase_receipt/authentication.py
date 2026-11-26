@@ -15,6 +15,7 @@ from agentscope.business._password_auth import (
     PasswordProfile,
     json_object,
 )
+from .list_layout import configured_purchase_page
 
 
 @dataclass
@@ -158,26 +159,20 @@ class PurchaseAuthentication:
             else None
         )
         page = {"total": data["total"], "records": data["records"][:limit]}
-        summary = (
-            await present(page)
-            if present
-            else {
-                "total": data["total"],
-                "records": [
-                    {
-                        key: row.get(key)
-                        for key in (
-                            "billNo",
-                            "billDate",
-                            "createdTime",
-                            "supplierName",
-                            "goodsTotalAmount",
-                        )
-                    }
-                    for row in page["records"]
-                ],
-            }
-        )
+        if present:
+            summary = await present(page)
+        else:
+            async with httpx.AsyncClient(
+                base_url=self.connection.base_url,
+                auth=self.connection.read_auth(profile),
+                timeout=15,
+                trust_env=False,
+                follow_redirects=False,
+            ) as client:
+                display = await configured_purchase_page(client, page)
+            summary = display["layout"].present(
+                display["records"], display["total"]
+            )
         if verified:
             summary["authentication"] = verified
         return summary

@@ -11,14 +11,14 @@ import { useTranslation } from '@/i18n/useI18n';
 export type SendCardReply = (content: ContentBlock[], quote: CardQuote) => Promise<void> | void;
 
 function readCard(result: ToolResultBlock) {
-	if (result.state !== 'success' || !/^query_recent_[a-zA-Z0-9_-]+$/.test(result.name))
-		return null;
+	if (result.state !== 'success') return null;
+	const text = getResultText(result);
+	if (!text.includes('"row_card"')) return null;
 	try {
-		const { row_card: card, records, list_ref: ref } = JSON.parse(getResultText(result));
+		const { row_card: card, records, list_ref: ref } = JSON.parse(text);
 		if (
 			card?.version !== 1 ||
 			typeof card.title !== 'string' ||
-			typeof ref !== 'string' ||
 			!Array.isArray(card.columns) ||
 			!card.columns.length ||
 			!card.columns.every(
@@ -33,6 +33,7 @@ function readCard(result: ToolResultBlock) {
 			title: card.title as string,
 			columns: card.columns as { key: string; label: string }[],
 			records: records as Record<string, unknown>[],
+			canOpen: typeof ref === 'string' && ref.length > 0 && /^query_recent_[a-zA-Z0-9_-]+$/.test(result.name),
 		};
 	} catch {
 		return null;
@@ -47,7 +48,7 @@ export function RowResultCard({
 }: {
 	messageId: string;
 	result: ToolResultBlock;
-	onSend: SendCardReply;
+	onSend?: SendCardReply;
 	disabled: boolean;
 }) {
 	const { t } = useTranslation();
@@ -57,8 +58,10 @@ export function RowResultCard({
 	const card = readCard(result);
 	if (!card) return null;
 	const busy = disabled || sending;
+	const canOpen = card.canOpen && Boolean(onSend);
+	const Row = canOpen ? 'button' : 'div';
 	const send = async (text: string) => {
-		if (!text || busy) return;
+		if (!text || busy || !onSend) return;
 		const now = new Date().toISOString();
 		setSending(true);
 		try {
@@ -94,26 +97,28 @@ export function RowResultCard({
 				</span>
 			</header>
 			{card.records.map((row, index) => (
-				<button
-					type="button"
+				<Row
 					key={index}
-					disabled={busy}
-					onClick={() => void send(t('rowCard.open', { row: index + 1 }))}
-					className="grid min-h-11 w-full grid-cols-[auto_1fr_auto] items-center gap-2 border-t px-3 py-2 text-start hover:bg-muted focus-visible:bg-muted disabled:opacity-60"
+					{...(canOpen ? {
+						type: 'button' as const,
+						disabled: busy,
+						onClick: () => void send(t('rowCard.open', { row: index + 1 })),
+					} : {})}
+					className="grid min-h-11 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 border-t px-3 py-2 text-start enabled:hover:bg-muted focus-visible:bg-muted disabled:opacity-60"
 				>
 					<span className="text-sm tabular-nums text-muted-foreground">{index + 1}</span>
-					<span className="grid min-w-0 grid-cols-2 gap-x-3 gap-y-1 sm:flex sm:flex-wrap">
+					<span className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,8rem),1fr))] gap-x-3 gap-y-2">
 						{card.columns.map(({ key, label }) => (
-							<span key={key} className="min-w-0 text-sm break-words sm:flex-1">
+							<span key={key} className="min-w-0 text-sm wrap-anywhere">
 								<span className="block text-xs text-muted-foreground">{label}</span>
 								{String(row[key] ?? '—')}
 							</span>
 						))}
 					</span>
-					<ChevronRight className="size-4" aria-hidden="true" />
-				</button>
+					{canOpen && <ChevronRight className="size-4" aria-hidden="true" />}
+				</Row>
 			))}
-			{card.records.length > 0 && (
+			{canOpen && card.records.length > 0 && (
 				<div className="border-t p-1">
 					{replying ? (
 						<form

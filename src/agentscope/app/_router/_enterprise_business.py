@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """Agent-owned enterprise business imports from the chat composer."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+import asyncio
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ...business._enterprise import (
@@ -15,6 +18,7 @@ from ...state import AgentState
 from .._types import AgentToolFactory
 from ..deps import get_current_user_id, get_extra_agent_tools, get_storage
 from ..storage import StorageBase
+from ..tool_login import tool_login_scope
 
 enterprise_business_router = APIRouter(
     prefix="/agent/{agent_id}/enterprise-business",
@@ -30,6 +34,24 @@ class EnterpriseBusinessInput(BaseModel):
     authentication: LoginRecipe | None = None
 
 
+class EnterpriseActionRow(BaseModel):
+    """The panel summary of an enterprise action."""
+
+    action_id: str
+    title: str
+    status: Literal["pending", "registered"]
+    completed: int
+    total: int
+    can_resume: bool
+
+
+class EnterpriseActionPage(BaseModel):
+    """One page of visible action summaries."""
+
+    actions: list[EnterpriseActionRow]
+    next_offset: int | None
+
+
 async def _owner(
     agent_id: str,
     user_id: str = Depends(get_current_user_id),
@@ -42,6 +64,84 @@ async def _owner(
 
 def _converter(request: Request) -> EnterpriseBusiness:
     return request.app.state.enterprise_business
+
+
+async def _action_session_state(
+    storage: StorageBase, user_id: str, agent_id: str, session_id: str
+) -> AgentState:
+    session = await storage.get_session(user_id, agent_id, session_id)
+    if session is None or session.agent_id != agent_id:
+        raise HTTPException(404, "Session not found.")
+    return session.state
+
+
+def _can_resume(state: AgentState) -> bool:
+    return not any(
+        not rule.rule_content
+        for rule in state.permission_context.deny_rules.get(
+            "resume_enterprise_action", []
+        )
+    )
+
+
+@enterprise_business_router.get("/actions")
+async def list_enterprise_actions(
+    agent_id: str,
+    session_id: str | None = None,
+    offset: int = Query(0, ge=0),
+    user_id: str = Depends(_owner),
+    storage: StorageBase = Depends(get_storage),
+    converter: EnterpriseBusiness = Depends(_converter),
+) -> EnterpriseActionPage:
+    """List visible actions without invoking any of their business reads."""
+    state = AgentState()
+    if session_id is not None:
+        state = await _action_session_state(
+            storage, user_id, agent_id, session_id
+        )
+    page = await asyncio.to_thread(
+        converter._action_progress, user_id, agent_id, "", offset, state=state
+    )
+    can_resume = session_id is not None and _can_resume(state)
+    for action in page["actions"]:
+        action["can_resume"] = can_resume and action["status"] == "pending"
+    return EnterpriseActionPage.model_validate(page)
+
+
+@enterprise_business_router.post("/actions/{action_id}/resume")
+async def resume_enterprise_action(
+    agent_id: str,
+    action_id: str,
+    session_id: str,
+    user_id: str = Depends(_owner),
+    storage: StorageBase = Depends(get_storage),
+    converter: EnterpriseBusiness = Depends(_converter),
+) -> EnterpriseActionRow:
+    """Continue validation in the same private login scope as chat."""
+    state = await _action_session_state(storage, user_id, agent_id, session_id)
+    try:
+        page = await asyncio.to_thread(
+            converter._action_progress,
+            user_id,
+            agent_id,
+            action_id,
+            0,
+            state=state,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "Action not found.") from exc
+    if not page["actions"]:
+        raise HTTPException(404, "Action not found.")
+    action = page["actions"][0]
+    if action["status"] == "pending":
+        if not _can_resume(state):
+            raise HTTPException(403, "Action resumption is denied.")
+        with tool_login_scope(user_id, agent_id, session_id):
+            action = await converter._verify_action(
+                user_id, agent_id, action_id, state
+            )
+    action["can_resume"] = action["status"] == "pending"
+    return EnterpriseActionRow.model_validate(action)
 
 
 @enterprise_business_router.get("")

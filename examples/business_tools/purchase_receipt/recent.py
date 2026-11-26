@@ -9,14 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from agentscope.business import RowActionSource, RowDetailTools, RowScope
-
-DISPLAY_FIELDS = (
-    "billNo",
-    "billDate",
-    "createdTime",
-    "supplierName",
-    "goodsTotalAmount",
-)
+from .list_layout import configured_purchase_page
 
 
 async def _data(client: httpx.AsyncClient, path: str, **kwargs: dict) -> dict:
@@ -47,11 +40,12 @@ def purchase_receipt_row_tools(
 
     async def page(owner: RowScope, limit: int) -> dict:
         async with client_for(owner) as client:
-            return await _data(
+            records = await _data(
                 client,
                 source.list_route,
                 params={"current": 1, "size": limit},
             )
+            return await configured_purchase_page(client, records)
 
     async def detail(owner: RowScope, params: dict) -> dict:
         def segment(match: re.Match) -> str:
@@ -69,14 +63,7 @@ def purchase_receipt_row_tools(
         database,
         name="purchase_receipts",
         title="采购入库单",
-        field_labels={
-            "billNo": "单号",
-            "billDate": "单据日期",
-            "createdTime": "创建时间",
-            "supplierName": "供应商",
-            "goodsTotalAmount": "金额",
-        },
-        visible_fields=DISPLAY_FIELDS,
+        visible_fields=(),
         scope=scope,
         can_read=can_read,
         list_rows=page,
@@ -109,12 +96,7 @@ def recent_purchase_receipts(
                 "/purchase/order/page",
                 params={"current": 1, "size": limit},
             )
-        return {
-            "total": page["total"],
-            "records": [
-                {field: row.get(field) for field in DISPLAY_FIELDS}
-                for row in page["records"]
-            ],
-        }
+            display = await configured_purchase_page(client, page)
+        return display["layout"].present(display["records"], display["total"])
 
     return query_recent_purchase_receipts

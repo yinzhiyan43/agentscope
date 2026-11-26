@@ -215,11 +215,14 @@ def _login_key(record: dict, api: "EnterpriseReadAPI") -> str | None:
     profile = record.get("authentication", {"mode": "legacy"})
     if profile["mode"] in ("public", "legacy") or (
         profile["mode"] in ("bearer", "header")
+        and not api.login_adapter
+        and not profile.get("client")
         and api.token
         and "login" not in profile
     ):
         return None
-    return _digest([api.key, record["document_id"], profile])
+    parts = [api.key, record["document_id"], profile]
+    return _digest(parts)
 
 
 def _runtime(
@@ -246,7 +249,9 @@ def _runtime(
     if service:
         if login is None:
             raise ValueError("An active private login is required.")
-        auth = login.auth(api.base_url, service, profile)
+        auth = login.auth(
+            api.base_url, service, profile, adapter=api.login_adapter
+        )
     tool = as_tool(
         artifact, api.base_url, token, auth=auth, static_headers=static_headers
     )
@@ -345,7 +350,14 @@ def bindings(
                     )
                     continue
                 if load_tools:
-                    tools[record["name"]] = _runtime(record, reads[0], login)
+                    try:
+                        tools[record["name"]] = _runtime(
+                            record, reads[0], login
+                        )
+                    except ValueError:
+                        record.update(
+                            status="pending", reason="invalid_read_connection"
+                        )
             else:
                 record.update(status="pending", reason="verification_required")
     for registry, records in save_groups.items():

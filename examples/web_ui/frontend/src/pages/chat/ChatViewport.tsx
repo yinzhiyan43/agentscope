@@ -26,7 +26,7 @@ import type {
 	UpdateSessionRequest,
 } from '@/api';
 import { asrApi, sessionApi } from '@/api';
-import { enterpriseSkillKey } from '@/api/enterpriseBusiness';
+import { enterpriseActionKey, enterpriseSkillKey } from '@/api/enterpriseBusiness';
 import MCPSvg from '@/assets/images/mcp.svg?react';
 import { ChatContent } from '@/components/chat/ChatContent.tsx';
 import { SubagentHitlCard } from '@/components/chat/SubagentHitlCard';
@@ -311,9 +311,10 @@ export function ChatViewport({
 			}
 			if (value.permission_context) {
 				setPermissionContext(value.permission_context as PermissionContext);
+				if (agentId) void queryClient.invalidateQueries({ queryKey: enterpriseActionKey(agentId) });
 			}
 		},
-		[sessionId],
+		[agentId, sessionId],
 	);
 
 	const [toolLoginChange, setToolLoginChange] = useState(0);
@@ -352,6 +353,7 @@ export function ChatViewport({
 	useEffect(() => {
 		if (phase === 'idle' && lastPhase.current !== 'idle' && agentId) {
 			void queryClient.invalidateQueries({ queryKey: enterpriseSkillKey(agentId) });
+			void queryClient.invalidateQueries({ queryKey: enterpriseActionKey(agentId) });
 		}
 		lastPhase.current = phase;
 	}, [phase, agentId]);
@@ -559,6 +561,7 @@ export function ChatViewport({
 						sessionId={sessionId}
 						skills={skills}
 						loading={skillsLoading}
+						resumeDisabled={phase !== 'idle' || voiceBusy}
 						onUpload={uploadSkill}
 						onAddFromLibrary={addSkillsFromLibrary}
 						onRemove={removeSkill}
@@ -640,6 +643,8 @@ export function ChatViewport({
 			removeMcp,
 			skills,
 			skillsLoading,
+			phase,
+			voiceBusy,
 			uploadSkill,
 			addSkillsFromLibrary,
 			removeSkill,

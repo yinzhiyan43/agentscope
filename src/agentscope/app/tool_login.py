@@ -60,9 +60,11 @@ class LoginField(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     label: str
     label_key: str | None = None
-    kind: Literal["text", "secret"] = "text"
+    kind: Literal["text", "secret", "one-time-code"] = "text"
     required: bool = True
     options: list[LoginOption] | None = None
+    suggestions: list[str] | None = None
+    agreement: str | None = None
 
 
 class LoginStep(BaseModel):

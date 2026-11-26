@@ -66,6 +66,23 @@ for (const [device, width] of [
 			await old.getByRole('button', { name: '发送', exact: true }).click();
 			await details.nth(1).waitFor();
 			assert.equal(await page.getByText('回复列表卡片', { exact: true }).count(), 2);
+			if (system === 'purchase_receipts') {
+				const sendText = async (text) => {
+					const composer = page.locator('textarea:visible');
+					await composer.fill(text);
+					if (device === 'mobile') {
+						await page.getByRole('button', { name: '发送', exact: true }).tap();
+					} else {
+						await composer.press('Enter');
+					}
+				};
+				await sendText('获取刚才列表里，入库单号是同号的详情');
+				await page.getByText(/有 2 条记录匹配，请补充可见列条件/).waitFor();
+				await sendText('补充条件：供应商=供应商 1');
+				await page.locator('[data-role="assistant"] code').filter({ hasText: 'detail-1' }).waitFor();
+				await sendText('获取 id=1 的详情');
+				await page.getByText(/请使用原列表中的可见列名和精确值/).waitFor();
+			}
 		});
 	}
 }

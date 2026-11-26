@@ -5,12 +5,18 @@ import asyncio
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
+from fastapi import FastAPI
+from httpx import AsyncClient
 
 from agentscope.app._enterprise_login import EnterpriseLogin
+from agentscope.app._router._enterprise_business import (
+    enterprise_business_router,
+)
 from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.tool_login import ToolLogin, tool_login_scope
 from agentscope.business import EnterpriseBusiness, EnterpriseReadAPI
@@ -404,6 +410,111 @@ class EnterpriseActionTest(IsolatedAsyncioTestCase):
             self.assertTrue(
                 all(account not in receipt for account in accounts)
             )
+
+    async def test_panel_hides_actions_and_resumes_in_owned_session(self):
+        self.mode = "fail"
+        visible = await self.register()
+        self.plan["title"] = "Private action"
+        hidden = await self.register()
+        hidden_path = self.svc._action_path(
+            "one", "current", hidden["action_id"]
+        )
+        hidden_record = json.loads(hidden_path.read_text())
+        hidden_record["visible"] = False
+        hidden_path.write_text(json.dumps(hidden_record))
+
+        app = FastAPI()
+        app.include_router(enterprise_business_router)
+        app.state.enterprise_business = self.svc
+        self.svc.local_user = "one"
+        verify = self.svc._verify_action
+
+        async def verify_in_chat(user_id, agent_id, action_id, state):
+            self.assertEqual(
+                ToolLogin.current_scope(), ("one", "current", "chat")
+            )
+            return await verify(user_id, agent_id, action_id, state)
+
+        resume = patch.object(self.svc, "_verify_action", verify_in_chat)
+        resume.start()
+        self.addCleanup(resume.stop)
+        app.state.storage = SimpleNamespace(
+            get_agent=AsyncMock(return_value=object()),
+            get_session=AsyncMock(
+                side_effect=lambda _u, _a, session: SimpleNamespace(
+                    agent_id="current" if session == "chat" else "other",
+                    state=self.state,
+                )
+            ),
+        )
+        path = "/agent/current/enterprise-business/actions"
+        params = {"session_id": "chat"}
+        resume_path = path + "/" + visible["action_id"] + "/resume"
+        hidden_resume = path + "/" + hidden["action_id"] + "/resume"
+        async with AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            headers={"X-User-ID": "one"},
+        ) as client:
+            outsider = await client.get(
+                path, headers={"X-User-ID": "outsider"}
+            )
+            self.assertEqual(outsider.status_code, 401)
+            response = await client.get(path, params=params)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json(),
+                {
+                    "actions": [
+                        {
+                            "action_id": visible["action_id"],
+                            "title": "Find entry by number",
+                            "status": "pending",
+                            "completed": 1,
+                            "total": 2,
+                            "can_resume": True,
+                        },
+                    ],
+                    "next_offset": None,
+                },
+            )
+            foreign = await client.post(
+                resume_path, params={"session_id": "foreign"}
+            )
+            self.assertEqual(foreign.status_code, 404)
+            self.assertEqual(
+                (await client.post(hidden_resume, params=params)).status_code,
+                404,
+            )
+            engine = PermissionEngine(self.state.permission_context)
+            engine.add_rule(
+                PermissionRule(
+                    tool_name=self.detail,
+                    rule_content=None,
+                    behavior=PermissionBehavior.DENY,
+                    source="userSettings",
+                )
+            )
+            denied = await client.get(path, params=params)
+            self.assertEqual(denied.json()["actions"], [])
+            self.assertEqual(
+                (await client.post(resume_path, params=params)).status_code,
+                404,
+            )
+            self.state.permission_context.deny_rules.clear()
+            self.assertEqual(len(self.sent), 4)
+
+            self.mode = "ok"
+            result = await client.post(resume_path, params=params)
+            self.assertEqual(result.status_code, 200)
+            action = result.json()
+            self.assertEqual(
+                (action["status"], action["completed"]), ("registered", 2)
+            )
+            self.assertEqual(
+                self.sent[4:], ["https://example.test/v1/entries/7"]
+            )
+            self.assertFalse(action["can_resume"])
 
     async def test_source_change_invalidates_only_the_affected_suffix(self):
         source = self.root / "client"

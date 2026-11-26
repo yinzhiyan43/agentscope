@@ -57,10 +57,16 @@ async def get_current_user_id(
         return principal
     if not x_user_id:
         raise HTTPException(401, "X-User-ID header is required.")
+    path = request.url.path.rstrip("/")
     if enterprise and (
-        request.url.path.rstrip("/").endswith(
-            ("/enterprise-business", "/enterprise-business/skills")
+        path.endswith(
+            (
+                "/enterprise-business",
+                "/enterprise-business/skills",
+                "/enterprise-business/actions",
+            )
         )
+        or "/enterprise-business/actions/" in path
         or enterprise.protects_user(x_user_id)
     ):
         origin = request.headers.get("origin")

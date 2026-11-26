@@ -29,7 +29,22 @@ class ResidentPurchaseTest(IsolatedAsyncioTestCase):
     ) -> None:
         """Check list snapshots, live permissions and ledger isolation."""
         scope = ("reader", "agent", "chat")
-        rows = [{"id": 41, "billNo": "同号"}, {"id": 29, "billNo": "同号"}]
+        display_row = {
+            "billNo": "同号",
+            "billDate": "隐藏业务日期",
+            "supplierName": "供应商 A",
+            "supplierPhone": "权限隐藏电话",
+            "goodsTotalAmount": 10,
+            "paidAmount": 7,
+            "customField1": "可见自定义字段",
+            "customField2": "隐藏自定义字段",
+            "listStatus": {
+                "listPrintCount": 0,
+                "listApproveStatus": "已审核",
+                "listPrintStatus": "隐藏打印状态",
+            },
+        }
+        rows = [{**display_row, "id": key} for key in (41, 29)]
         info = {
             "tenantId": 12,
             "username": "employee",
@@ -37,15 +52,41 @@ class ResidentPurchaseTest(IsolatedAsyncioTestCase):
             "permissions": ["purchase:order:view"],
         }
         calls = []
+        settings = {
+            "visible-columns": ["supplierPhone", "paidAmount"],
+            "column-config/list": [
+                {"columnKey": "supplierName", "columnSort": 1},
+                {"columnKey": "billNo", "columnSort": 2},
+                {"columnKey": "goodsTotalAmount", "columnVisible": 0},
+            ],
+            "custom-field/list": [
+                {
+                    "fieldCode": "custom_1",
+                    "fieldLabel": "渠道",
+                    "isVisible": 1,
+                },
+                {
+                    "fieldCode": "custom_2",
+                    "fieldLabel": "内部",
+                    "isVisible": 0,
+                },
+            ],
+            "field-description/all": {},
+        }
 
         def backend(request: httpx.Request) -> httpx.Response:
             calls.append(request.url.path)
             self.assertEqual(request.method, "GET")
-            data = (
-                info
-                if request.url.path.endswith("/auth/info")
-                else {"order": {"id": 29}, "details": [{"remark1": "第二行"}]}
-            )
+            if request.url.path.endswith("/auth/info"):
+                data = info
+            elif "/system/" in request.url.path:
+                data = next(
+                    value
+                    for path, value in settings.items()
+                    if path in request.url.path
+                )
+            else:
+                data = {"order": {"id": 29}, "details": [{"remark1": "第二行"}]}
             return httpx.Response(200, json={"code": 200, "data": data})
 
         connection = Mock(
@@ -144,7 +185,22 @@ class ResidentPurchaseTest(IsolatedAsyncioTestCase):
                 listed = await tools["query_recent_purchase_receipts"](limit=2)
                 page = json.loads(listed.content[0].text)
                 self.assertEqual(page["records"][0], page["records"][1])
-                self.assertNotIn("id", page["records"][0])
+                columns = page["row_card"]["columns"]
+                self.assertEqual(
+                    columns[:2],
+                    [
+                        {"key": "supplierName", "label": "供应商"},
+                        {"key": "billNo", "label": "入库单号"},
+                    ],
+                )
+                projected = page["records"][0]
+                self.assertEqual(list(projected), [c["key"] for c in columns])
+                self.assertEqual(projected["customField1"], "可见自定义字段")
+                self.assertEqual(projected["listPrintCount"], 0)
+                self.assertFalse({
+                    "id", "billDate", "supplierPhone", "goodsTotalAmount",
+                    "paidAmount", "customField2", "listStatus", "listPrintStatus",
+                }.intersection(projected))
                 ref = page["list_ref"]
                 args = {"list_ref": ref, "row_number": 2}
                 rows.reverse()
@@ -163,6 +219,11 @@ class ResidentPurchaseTest(IsolatedAsyncioTestCase):
                     await opener(**args)
                 self.assertEqual(calls.count("/api/purchase/order/29"), 1)
                 connection.read.assert_awaited_once()
+                info["permissions"] = ["purchase:order:view"]
+                info["tenantId"] = 12
+                settings["visible-columns"] = {"failed": True}
+                with self.assertRaisesRegex(ValueError, "显示配置格式不正确"):
+                    await tools["query_recent_purchase_receipts"](limit=2)
             with tool_login_scope("reader", "agent", "other-chat"):
                 with self.assertRaisesRegex(PermissionError, "变化"):
                     await opener(**args)

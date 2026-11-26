@@ -23,6 +23,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from ..business._business import validate_api_base_url
 from ..business._enterprise_config import EnterpriseLimits
+from ..business._response_match import ResponseMatch
 from .tool_login import (
     LoginEnded,
     LoginFailed,
@@ -66,6 +67,20 @@ def _at(value: Any, pointer: str) -> Any:
     return value
 
 
+def _matches_lookup(row: Any, filters: dict, payload: dict) -> bool:
+    try:
+        return all(
+            _same_value(_at(row, pointer), payload[field])
+            for pointer, field in filters.items()
+        )
+    except (IndexError, KeyError, TypeError):
+        return False
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    return type(left) is type(right) and left == right
+
+
 def _checked(schema: dict, value: Any) -> bool:
     return Draft202012Validator(
         schema, format_checker=FormatChecker()
@@ -88,9 +103,17 @@ def _input(field: str, schema: dict, raw: str) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class EnterpriseLoginAdapter:
+    """A trusted host callback returning a credential and stable identity components."""
+
+    login: Callable[[ToolLogin, str, str], Awaitable[tuple[str, tuple]]]
+    expired: tuple[ResponseMatch, ...] = ()
+
+
 async def _login(
     broker: ToolLogin, service: str, base: str, profile: dict
-) -> str:
+) -> tuple[str, tuple | None]:
     login = profile.get("login")
     mode = profile["mode"]
     if not login:
@@ -127,7 +150,7 @@ async def _login(
                 return LoginSuccess(header)
             return LoginSuccess(_header_value(values["credential"], mode))
 
-        return await broker.request(
+        header = await broker.request(
             service,
             LoginStep(
                 title="API authentication",
@@ -139,17 +162,21 @@ async def _login(
             ),
             direct,
         )
+        return header, None
 
     schema = login["schema"]
     props = schema["properties"]
     payload: dict = {}
+    challenge = login.get("challenge") or {}
 
     async def collect(
         names: list[str],
         destination: str,
         *,
         lookup: bool = False,
-        finish: Callable[[dict], Awaitable[str]] | None = None,
+        required: bool = False,
+        finish: Callable[[dict], Awaitable[tuple[str, tuple | None] | None]]
+        | None = None,
     ) -> Any:
         # Submit the last page to the service inside the private form callback.
         # A rejected login can then be corrected in the same form.
@@ -158,8 +185,17 @@ async def _login(
                 LoginField(
                     name=name,
                     label=props[name].get("title") or name,
-                    kind="text" if lookup else "secret",
-                    required=lookup or name in schema.get("required", []),
+                    kind=(
+                        "one-time-code"
+                        if name == challenge.get("answer")
+                        else "text"
+                        if lookup
+                        else "secret"
+                    ),
+                    required=lookup
+                    or required
+                    or name == challenge.get("answer")
+                    or name in schema.get("required", []),
                 )
                 for name in names[start : start + 12]
             ]
@@ -209,7 +245,10 @@ async def _login(
             missing = list(
                 dict.fromkeys(
                     source
-                    for source in dep["parameters"].values()
+                    for source in (
+                        *dep["parameters"].values(),
+                        *dep.get("filters", {}).values(),
+                    )
                     if source not in payload
                 )
             )
@@ -252,6 +291,13 @@ async def _login(
                     rows = []
                 elif not isinstance(rows, list):
                     rows = [rows]
+                filters = dep.get("filters", {})
+                if filters:
+                    rows = [
+                        row
+                        for row in rows
+                        if _matches_lookup(row, filters, payload)
+                    ]
                 options = []
                 for index, row in enumerate(rows):
                     value = _at(row, dep["value"])
@@ -316,7 +362,17 @@ async def _login(
                 )
             payload[name] = _at(rows[index], dep["value"])
 
-        async def exchange(body: dict) -> str:
+        expired = [
+            ResponseMatch.model_validate(rule)
+            for rule in challenge.get("expired", [])
+        ]
+        triggers = [
+            ResponseMatch.model_validate(rule)
+            for rule in challenge.get("when", [])
+        ]
+        needs_code = bool(challenge) and not triggers
+
+        async def exchange(body: dict) -> tuple[str, tuple | None] | None:
             body = {key: value for key, value in body.items() if key in props}
             if not _checked(schema, body):
                 raise LoginRejected(
@@ -327,6 +383,15 @@ async def _login(
                 response = await client.post(
                     login["route"].lstrip("/"), json=body
                 )
+                if not needs_code and any(
+                    rule.matches(response) for rule in triggers
+                ):
+                    payload.update(body)
+                    return None
+                if needs_code and any(
+                    rule.matches(response) for rule in expired
+                ):
+                    return None
                 if response.status_code in (400, 401, 403, 422):
                     raise LoginRejected(
                         "The service rejected these authentication inputs. Check them and try again.",
@@ -342,21 +407,121 @@ async def _login(
                         "The service did not issue a credential. Check your authentication inputs.",
                         code="missingCredential",
                     )
-                return _header_value(value, mode)
+                header = _header_value(value, mode)
+                check = login.get("identity")
+                if not check:
+                    return header, None
+                identity_response = await client.get(
+                    check["route"].lstrip("/"),
+                    headers={profile.get("header", "Authorization"): header},
+                )
+                identity_response.raise_for_status()
+                info = identity_response.json()
+                try:
+                    identity = []
+                    for name, pointer in sorted(check["fields"].items()):
+                        actual = _at(info, pointer)
+                        if actual is None or not _same_value(
+                            actual, body[name]
+                        ):
+                            raise ValueError
+                        identity.append(json.dumps(actual, sort_keys=True))
+                except (KeyError, IndexError, TypeError, ValueError):
+                    raise LoginRejected("登录身份与所选条件不一致。") from None
+                return header, tuple(identity)
             except (httpx.HTTPError, ValueError):
                 raise LoginFailed(
                     "The authentication response does not match the interface definition.",
                     code="unexpectedResponse",
                 ) from None
 
-        names = [
-            name
-            for name, prop in props.items()
-            if name not in payload and not prop.get("readOnly")
-        ]
-        return await collect(
-            names, "POST " + base + login["route"], finish=exchange
-        )
+        async def issue_code(
+            _step: LoginStep, _values: Mapping[str, str]
+        ) -> LoginSuccess:
+            route = challenge["route"]
+            arguments = {
+                key: payload[source]
+                for key, source in challenge["parameters"].items()
+            }
+            body_schema = challenge["body_schema"]
+            if body_schema is not None and not _checked(
+                body_schema, arguments
+            ):
+                raise LoginFailed("验证码请求参数与接口定义不一致。")
+            try:
+                response = await client.post(
+                    route.lstrip("/"),
+                    json=arguments if body_schema is not None else None,
+                )
+                response.raise_for_status()
+                if success := challenge.get("success"):
+                    if not ResponseMatch.model_validate(success).matches(
+                        response
+                    ):
+                        raise ValueError
+                for name, pointer in challenge["bindings"].items():
+                    value = _at(response.json(), pointer)
+                    if value is None or not _checked(props[name], value):
+                        raise ValueError
+                    payload[name] = value
+                return LoginSuccess(None)
+            except (
+                httpx.HTTPError,
+                ValueError,
+                KeyError,
+                IndexError,
+                TypeError,
+            ):
+                raise LoginFailed(
+                    "获取验证码挑战失败，请重新发起登录。"
+                ) from None
+
+        renewed = False
+        while True:
+            if needs_code and (route := challenge.get("route")):
+                missing = list(
+                    dict.fromkeys(
+                        name
+                        for name in challenge["parameters"].values()
+                        if name not in payload
+                    )
+                )
+                if missing:
+                    await collect(
+                        missing, "POST " + base + route, required=True
+                    )
+
+                await broker.request(
+                    service,
+                    LoginStep(
+                        title="Request a new code"
+                        if renewed
+                        else "Request a verification code",
+                        title_key="renewCode" if renewed else "requestCode",
+                        description=base + route,
+                        submit_label="Request code",
+                        submit_label_key="requestCode",
+                        fields=[],
+                    ),
+                    issue_code,
+                )
+            names = [
+                name
+                for name, prop in props.items()
+                if name not in payload
+                and not prop.get("readOnly")
+                and name != challenge.get("answer")
+                and name not in challenge.get("bindings", {})
+            ]
+            if needs_code:
+                names.append(challenge["answer"])
+            result = await collect(
+                names, "POST " + base + login["route"], finish=exchange
+            )
+            if result is not None:
+                return result
+            renewed = needs_code
+            needs_code = True
 
 
 def _header_value(value: str, mode: str) -> str:
@@ -376,6 +541,7 @@ def _header_value(value: str, mode: str) -> str:
 @dataclass(frozen=True)
 class _Credential:
     header: str = field(repr=False)
+    identity: tuple | None = field(default=None, repr=False)
     generation: str = field(default_factory=lambda: uuid4().hex)
 
 
@@ -392,9 +558,11 @@ class EnterpriseLogin:
         self,
         broker: ToolLogin,
         *,
+        adapters: Mapping[str, EnterpriseLoginAdapter] | None = None,
         max_cached_credentials: int = EnterpriseLimits.max_cached_credentials,
     ) -> None:
         self.broker = broker
+        self._adapters = dict(adapters or {})
         self._max_cached_credentials = max_cached_credentials
         self._headers: OrderedDict[tuple, _Credential] = OrderedDict()
         self._pending: dict[tuple, _Challenge] = {}
@@ -409,23 +577,39 @@ class EnterpriseLogin:
         return credential.generation if credential is not None else None
 
     async def _issue(
-        self, key: tuple, base: str, service: str, profile: dict
+        self,
+        key: tuple,
+        base: str,
+        service: str,
+        profile: dict,
+        adapter: EnterpriseLoginAdapter | None,
     ) -> _Credential:
-        header = await _login(self.broker, service, base, profile)
-        credential = _Credential(header)
+        if adapter is None:
+            header, identity = await _login(
+                self.broker, service, base, profile
+            )
+        else:
+            value, identity = await adapter.login(self.broker, service, base)
+            header = _header_value(value, profile["mode"])
+        credential = _Credential(header, identity)
         self._headers[key] = credential
         if len(self._headers) > self._max_cached_credentials:
             self._headers.popitem(last=False)
         return credential
 
     async def _obtain(
-        self, key: tuple, base: str, service: str, profile: dict
+        self,
+        key: tuple,
+        base: str,
+        service: str,
+        profile: dict,
+        adapter: EnterpriseLoginAdapter | None,
     ) -> _Credential:
         challenge = self._pending.get(key)
         if challenge is None or challenge.task.done():
             challenge = _Challenge(
                 asyncio.create_task(
-                    self._issue(key, base, service, profile)
+                    self._issue(key, base, service, profile, adapter)
                 )
             )
             self._pending[key] = challenge
@@ -443,8 +627,35 @@ class EnterpriseLogin:
                         challenge.task, return_exceptions=True
                     )
 
-    def auth(self, base: str, service: str, profile: dict) -> httpx.Auth:
+    def auth(
+        self,
+        base: str,
+        service: str,
+        profile: dict,
+        *,
+        adapter: str | None = None,
+    ) -> httpx.Auth:
         validate_api_base_url(base, authenticated=True)
+        selected_adapter = self._adapters.get(adapter) if adapter else None
+        if adapter and (
+            selected_adapter is None
+            or profile["mode"] not in ("header", "bearer")
+        ):
+            raise ValueError(
+                "Unknown or incompatible enterprise login adapter"
+            )
+        if profile.get("client") and not selected_adapter:
+            raise ValueError(
+                "This saved login requires a configured host adapter"
+            )
+        expiry = (
+            selected_adapter.expired
+            if selected_adapter
+            else tuple(
+                ResponseMatch.model_validate(rule)
+                for rule in profile.get("login", {}).get("expired", [])
+            )
+        )
         manager = self
         base = base.rstrip("/")
         origin = httpx.URL(base)
@@ -468,16 +679,28 @@ class EnterpriseLogin:
                     raise ValueError("认证凭据仅用于已绑定服务的查询。")
                 key = (*manager.broker.current_scope(), service)
                 pinned = _pinned_generations.get()
+                expired_identity = None
                 for attempt in range(2):
                     credential = manager._headers.get(key)
-                    if pinned is not None and service in pinned and (
-                        credential is None
-                        or credential.generation != pinned[service]
+                    if (
+                        pinned is not None
+                        and service in pinned
+                        and (
+                            credential is None
+                            or credential.generation != pinned[service]
+                        )
                     ):
                         raise EnterpriseLoginChanged
                     if credential is None:
                         credential = await manager._obtain(
-                            key, base, service, profile
+                            key, base, service, profile, selected_adapter
+                        )
+                    if (
+                        expired_identity is not None
+                        and credential.identity != expired_identity
+                    ):
+                        raise LoginFailed(
+                            "重新登录后的身份已改变，请重新发起查询。"
                         )
                     if manager._headers.get(key) is credential:
                         manager._headers.move_to_end(key)
@@ -487,8 +710,15 @@ class EnterpriseLogin:
                         pinned[service] = credential.generation
                     request.headers[name] = credential.header
                     response = yield request
-                    if response.status_code != 401:
+                    expired = response.status_code == 401
+                    if not expired and expiry:
+                        await response.aread()
+                        expired = any(
+                            rule.matches(response) for rule in expiry
+                        )
+                    if not expired:
                         break
+                    expired_identity = credential.identity
                     if manager._headers.get(key) is credential:
                         manager._headers.pop(key, None)
                     if pinned is not None:

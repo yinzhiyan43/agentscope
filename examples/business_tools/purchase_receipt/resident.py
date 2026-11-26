@@ -14,6 +14,9 @@ from agentscope.tool import FunctionTool
 from examples.business_tools.purchase_receipt.authentication import (
     PurchaseAuthentication,
 )
+from examples.business_tools.purchase_receipt.list_layout import (
+    configured_purchase_page,
+)
 from examples.business_tools.purchase_receipt.recent import (
     purchase_receipt_row_tools,
 )
@@ -118,8 +121,11 @@ def with_purchase_rows(
             async def present(page: dict) -> dict:
                 # The list reader also verifies pending login profiles.
                 # Check the current user's ERP rights before exposing its rows.
-                async with client_for(owner):
-                    return await rows.present_page(owner, page)
+                async with client_for(owner) as client:
+                    display = await configured_purchase_page(client, page)
+                    return await rows.present_page(
+                        owner, display, layout=display["layout"]
+                    )
 
             return await auth.query(limit, present=present)
 
