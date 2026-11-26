@@ -4,10 +4,19 @@
 import asyncio
 import json
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+)
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 from jsonschema import Draft202012Validator, FormatChecker
@@ -15,6 +24,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from ..business._business import validate_api_base_url
 from ..business._enterprise_config import EnterpriseLimits
 from .tool_login import (
+    LoginEnded,
     LoginFailed,
     LoginField,
     LoginOption,
@@ -23,6 +33,26 @@ from .tool_login import (
     LoginSuccess,
     ToolLogin,
 )
+
+
+class EnterpriseLoginChanged(Exception):
+    """A composed read must restart because its credentials changed."""
+
+
+_pinned_generations: ContextVar[dict[str, str] | None] = ContextVar(
+    "enterprise_login_generations", default=None
+)
+
+
+@contextmanager
+def pin_enterprise_credentials() -> Iterator[dict[str, str]]:
+    """Keep each service on one credential generation for a composed read."""
+    pinned: dict[str, str] = {}
+    token = _pinned_generations.set(pinned)
+    try:
+        yield pinned
+    finally:
+        _pinned_generations.reset(token)
 
 
 def _at(value: Any, pointer: str) -> Any:
@@ -343,9 +373,15 @@ def _header_value(value: str, mode: str) -> str:
     return "Bearer " + value if mode == "bearer" else value
 
 
+@dataclass(frozen=True)
+class _Credential:
+    header: str = field(repr=False)
+    generation: str = field(default_factory=lambda: uuid4().hex)
+
+
 @dataclass
 class _Challenge:
-    task: asyncio.Task[str]
+    task: asyncio.Task[_Credential]
     waiters: int = 0
 
 
@@ -360,31 +396,47 @@ class EnterpriseLogin:
     ) -> None:
         self.broker = broker
         self._max_cached_credentials = max_cached_credentials
-        self._headers: OrderedDict[tuple, str] = OrderedDict()
+        self._headers: OrderedDict[tuple, _Credential] = OrderedDict()
         self._pending: dict[tuple, _Challenge] = {}
+
+    def credential_generation(self, service: str) -> str | None:
+        """Return the in-memory credential generation for this chat, if any."""
+        try:
+            key = (*self.broker.current_scope(), service)
+        except LoginEnded:
+            return None
+        credential = self._headers.get(key)
+        return credential.generation if credential is not None else None
+
+    async def _issue(
+        self, key: tuple, base: str, service: str, profile: dict
+    ) -> _Credential:
+        header = await _login(self.broker, service, base, profile)
+        credential = _Credential(header)
+        self._headers[key] = credential
+        if len(self._headers) > self._max_cached_credentials:
+            self._headers.popitem(last=False)
+        return credential
 
     async def _obtain(
         self, key: tuple, base: str, service: str, profile: dict
-    ) -> str:
+    ) -> _Credential:
         challenge = self._pending.get(key)
-        if challenge is None:
+        if challenge is None or challenge.task.done():
             challenge = _Challenge(
                 asyncio.create_task(
-                    _login(self.broker, service, base, profile)
+                    self._issue(key, base, service, profile)
                 )
             )
             self._pending[key] = challenge
         challenge.waiters += 1
         try:
-            value = await asyncio.shield(challenge.task)
-            self._headers[key] = value
-            if len(self._headers) > self._max_cached_credentials:
-                self._headers.popitem(last=False)
-            return value
+            return await asyncio.shield(challenge.task)
         finally:
             challenge.waiters -= 1
             if not challenge.waiters:
-                self._pending.pop(key, None)
+                if self._pending.get(key) is challenge:
+                    self._pending.pop(key)
                 if not challenge.task.done():
                     challenge.task.cancel()
                     await asyncio.gather(
@@ -415,19 +467,33 @@ class EnterpriseLogin:
                 ):
                     raise ValueError("认证凭据仅用于已绑定服务的查询。")
                 key = (*manager.broker.current_scope(), service)
+                pinned = _pinned_generations.get()
                 for attempt in range(2):
-                    header = manager._headers.get(key)
-                    if header is None:
-                        header = await manager._obtain(
+                    credential = manager._headers.get(key)
+                    if pinned is not None and service in pinned and (
+                        credential is None
+                        or credential.generation != pinned[service]
+                    ):
+                        raise EnterpriseLoginChanged
+                    if credential is None:
+                        credential = await manager._obtain(
                             key, base, service, profile
                         )
-                    manager._headers.move_to_end(key)
-                    request.headers[name] = header
+                    if manager._headers.get(key) is credential:
+                        manager._headers.move_to_end(key)
+                    elif pinned is not None:
+                        raise EnterpriseLoginChanged
+                    if pinned is not None:
+                        pinned[service] = credential.generation
+                    request.headers[name] = credential.header
                     response = yield request
                     if response.status_code != 401:
                         break
-                    if manager._headers.get(key) == header:
+                    if manager._headers.get(key) is credential:
                         manager._headers.pop(key, None)
+                    if pinned is not None:
+                        # Later requests can contain values from earlier reads.
+                        raise EnterpriseLoginChanged
                     if not attempt:
                         await response.aread()
 

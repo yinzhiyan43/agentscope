@@ -182,9 +182,16 @@ class BoundRead:
     tool: PublishedBusinessTool
     route: str
     revision: str
-    probe_scope: str
     sample: dict
     arguments: Callable[[dict, bool], dict]
+    login_service: str | None
+    credential_generation: Callable[[], str | None] | None
+
+    def generation(self) -> str | None:
+        """Return the login generation, or an empty value for static reads."""
+        if self.credential_generation is None:
+            return ""
+        return self.credential_generation()
 
 
 def _verification_inputs(
@@ -327,6 +334,21 @@ def action_view(record: dict, blocked: ActionBlocked | None = None) -> dict:
 Binder = Callable[[dict, ActionPlan], list[BoundRead]]
 
 
+def _check_pinned_credentials(
+    reads: list[BoundRead], pinned: dict[str, str]
+) -> None:
+    from ..app._enterprise_login import EnterpriseLoginChanged
+
+    for read in reads:
+        service = read.login_service
+        if (
+            service is not None
+            and service in pinned
+            and read.generation() != pinned[service]
+        ):
+            raise EnterpriseLoginChanged
+
+
 async def verify_action(
     path: Path,
     bind: Binder,
@@ -336,174 +358,218 @@ async def verify_action(
     poll_seconds: float = PUBLICATION_POLL_SECONDS,
 ) -> dict:
     """Atomic writes track each successful GET. The lock is released on process exit."""
-    from ..app.tool_login import LoginEnded, LoginFailed
+    from ..app._enterprise_login import (
+        EnterpriseLoginChanged,
+        pin_enterprise_credentials,
+    )
 
     if draft is None and not path.is_file():
         raise ValueError("No such action for this Agent.")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     async with _publication_lock(path, poll_seconds=poll_seconds):
-        previous = json.loads(path.read_bytes()) if path.is_file() else None
-        if previous is None and draft is None:
-            raise ValueError("No such action for this Agent.")
-        record = draft if draft is not None else previous
-        plan = ActionPlan.model_validate(record["plan"])
-        supplied = record["sample"]
-        validate(
-            {**plan.input_schema(), "required": []},
-            supplied,
-            "Verification input",
-        )
-        past = previous["passed"] if previous else []
-        needed = plan.projections()
-        record.pop("missing_inputs", None)
-        record.pop("diagnostic", None)
-        if previous is None:
-            record.update(
-                status="pending", reason=None, passed=[], revisions=[]
-            )
-            write_definition(path, record)
-        try:
-            reads = await asyncio.to_thread(bind, record, plan)
-        except ActionBlocked as exc:
-            # Keep resumable evidence during a temporary loss of a binding.
-            record.update(
-                status="pending",
-                reason=str(exc),
-                passed=past
-                if previous
-                and previous["plan"] == record["plan"]
-                and previous["sample"] == supplied
-                else [],
-                blocked_step=exc.step,
-                diagnostic=exc.diagnostic,
-                revisions=[],
-            )
-            write_definition(path, record)
-            return action_view(record)
-        revisions = [read.revision for read in reads]
-        record["routes"] = {
-            step.key: read.route
-            for step, read in zip(plan.steps, reads, strict=True)
-        }
-        inputs = _verification_inputs(plan, reads, supplied)
-        missing = sorted(plan.inputs.keys() - inputs.keys())
-        if missing:
-            record.update(
-                status="pending",
-                reason="verification_inputs_required",
-                missing_inputs=missing,
-                passed=[],
-                revisions=revisions,
-                blocked_step=None,
-            )
-            write_definition(path, record)
-            return action_view(record)
-        # Reuse only the common validated prefix of this plan, sample and identity.
-        fingerprints = [
-            definition_digest(
-                [
-                    read.revision,
-                    read.probe_scope,
-                    step.model_dump(),
-                    inputs,
-                    plan.inputs,
-                    sorted(needed[step.key]),
-                ]
-            )
-            for step, read in zip(plan.steps, reads, strict=True)
-        ]
-        passed = []
-        outputs = {}
-        for i, (fingerprint, checkpoint) in enumerate(zip(fingerprints, past)):
-            if checkpoint["fingerprint"] != fingerprint:
-                break
-            # A resumed validation must still be allowed to use each prerequisite.
-            args = await asyncio.to_thread(
-                reads[i].arguments, _wire(plan.steps[i], inputs, outputs), True
-            )
-            decision = await PermissionEngine(
-                state.permission_context
-            ).check_permission(reads[i].tool, args)
-            if decision.behavior != PermissionBehavior.ALLOW:
-                break
-            passed.append(checkpoint)
-            outputs[plan.steps[i].key] = checkpoint["values"]
-        if (
-            len(passed) == len(reads)
-            and previous
-            and previous["status"] == "registered"
-            and previous["plan"] == record["plan"]
-        ):
-            return action_view(previous)
+        for _ in range(2):
+            with pin_enterprise_credentials() as pinned:
+                try:
+                    return await _verify_locked(
+                        path, bind, state, draft, pinned
+                    )
+                except EnterpriseLoginChanged:
+                    record = json.loads(path.read_bytes())
+                    record.update(
+                        passed=[],
+                        status="pending",
+                        reason="authentication_changed",
+                        blocked_step=None,
+                    )
+                    write_definition(path, record)
+        return action_view(record)
+
+
+async def _verify_locked(
+    path: Path,
+    bind: Binder,
+    state: AgentState,
+    draft: dict | None,
+    pinned: dict[str, str],
+) -> dict:
+    from ..app.tool_login import LoginEnded, LoginFailed
+
+    previous = json.loads(path.read_bytes()) if path.is_file() else None
+    if previous is None and draft is None:
+        raise ValueError("No such action for this Agent.")
+    record = draft if draft is not None else previous
+    plan = ActionPlan.model_validate(record["plan"])
+    supplied = record["sample"]
+    validate(
+        {**plan.input_schema(), "required": []},
+        supplied,
+        "Verification input",
+    )
+    past = previous["passed"] if previous else []
+    needed = plan.projections()
+    record.pop("missing_inputs", None)
+    record.pop("diagnostic", None)
+    if previous is None:
         record.update(
-            passed=passed,
-            status="pending",
-            reason=None,
-            blocked_step=None,
-            revisions=revisions,
+            status="pending", reason=None, passed=[], revisions=[]
         )
         write_definition(path, record)
-        for i in range(len(passed), len(reads)):
-            step = plan.steps[i]
-            try:
-                _, values = await _execute(
-                    step,
-                    reads[i],
-                    inputs,
-                    outputs,
-                    needed[step.key],
-                    state,
-                    verifying=True,
-                )
-            except (
-                LoginEnded,
-                LoginFailed,
-                ValueError,
-                httpx.HTTPError,
-                OSError,
-                subprocess.TimeoutExpired,
-            ) as exc:
-                if isinstance(exc, ActionBlocked):
-                    code = exc.code
-                elif isinstance(exc, (LoginEnded, LoginFailed)):
-                    code = "authentication_required"
-                elif isinstance(exc, httpx.HTTPStatusError):
-                    code = f"upstream_http_{exc.response.status_code}"
-                else:
-                    code = "verification_failed"
-                record.update(
-                    reason=code,
-                    blocked_step=step.key,
-                    diagnostic=report_failure(
-                        code, "action_probe", exc, step=step.key
-                    ),
-                )
-                write_definition(path, record)
-                return action_view(record)
-            outputs[step.key] = values
-            passed.append({"fingerprint": fingerprints[i], "values": values})
-            write_definition(path, record)
-        # A connection or a source file could change while a probe was in flight.
-        try:
-            current = await asyncio.to_thread(bind, record, plan)
-            for step, before, after in zip(
-                plan.steps, reads, current, strict=True
-            ):
-                if before.revision != after.revision:
-                    raise ActionBlocked(
-                        "action_requires_verification", step.key
-                    )
-        except ActionBlocked as exc:
-            record.update(
-                reason=exc.code,
-                blocked_step=exc.step or plan.steps[0].key,
-                diagnostic=exc.diagnostic,
-            )
-            write_definition(path, record)
-            return action_view(record)
-        record["status"] = "registered"
+    try:
+        reads = await asyncio.to_thread(bind, record, plan)
+    except ActionBlocked as exc:
+        # Keep resumable evidence during a temporary loss of a binding.
+        record.update(
+            status="pending",
+            reason=str(exc),
+            passed=past
+            if previous
+            and previous["plan"] == record["plan"]
+            and previous["sample"] == supplied
+            else [],
+            blocked_step=exc.step,
+            diagnostic=exc.diagnostic,
+            revisions=[],
+        )
         write_definition(path, record)
         return action_view(record)
+    revisions = [read.revision for read in reads]
+    record["routes"] = {
+        step.key: read.route
+        for step, read in zip(plan.steps, reads, strict=True)
+    }
+    inputs = _verification_inputs(plan, reads, supplied)
+    missing = sorted(plan.inputs.keys() - inputs.keys())
+    if missing:
+        record.update(
+            status="pending",
+            reason="verification_inputs_required",
+            missing_inputs=missing,
+            passed=[],
+            revisions=revisions,
+            blocked_step=None,
+        )
+        write_definition(path, record)
+        return action_view(record)
+
+    def fingerprint(index: int, generation: str) -> str:
+        step = plan.steps[index]
+        return definition_digest(
+            [
+                reads[index].revision,
+                generation,
+                step.model_dump(),
+                inputs,
+                plan.inputs,
+                sorted(needed[step.key]),
+            ]
+        )
+
+    # Reuse the validated prefix only under the credential that produced it.
+    passed = []
+    outputs = {}
+    for i, (read, checkpoint) in enumerate(zip(reads, past)):
+        generation = read.generation()
+        if (
+            generation is None
+            or checkpoint["fingerprint"] != fingerprint(i, generation)
+        ):
+            break
+        # A resumed validation must still be allowed to use each prerequisite.
+        args = await asyncio.to_thread(
+            read.arguments, _wire(plan.steps[i], inputs, outputs), True
+        )
+        decision = await PermissionEngine(
+            state.permission_context
+        ).check_permission(read.tool, args)
+        if decision.behavior != PermissionBehavior.ALLOW:
+            break
+        if read.login_service is not None:
+            pinned.setdefault(read.login_service, generation)
+        passed.append(checkpoint)
+        outputs[plan.steps[i].key] = checkpoint["values"]
+    _check_pinned_credentials(reads, pinned)
+    if (
+        len(passed) == len(reads)
+        and previous
+        and previous["status"] == "registered"
+        and previous["plan"] == record["plan"]
+    ):
+        return action_view(previous)
+    record.update(
+        passed=passed,
+        status="pending",
+        reason=None,
+        blocked_step=None,
+        revisions=revisions,
+    )
+    write_definition(path, record)
+    for i in range(len(passed), len(reads)):
+        step = plan.steps[i]
+        read = reads[i]
+        try:
+            _, values = await _execute(
+                step,
+                read,
+                inputs,
+                outputs,
+                needed[step.key],
+                state,
+                verifying=True,
+            )
+        except (
+            LoginEnded,
+            LoginFailed,
+            ValueError,
+            httpx.HTTPError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            _check_pinned_credentials(reads, pinned)
+            if isinstance(exc, ActionBlocked):
+                code = exc.code
+            elif isinstance(exc, (LoginEnded, LoginFailed)):
+                code = "authentication_required"
+            elif isinstance(exc, httpx.HTTPStatusError):
+                code = f"upstream_http_{exc.response.status_code}"
+            else:
+                code = "verification_failed"
+            record.update(
+                reason=code,
+                blocked_step=step.key,
+                diagnostic=report_failure(
+                    code, "action_probe", exc, step=step.key
+                ),
+            )
+            write_definition(path, record)
+            return action_view(record)
+        outputs[step.key] = values
+        generation = pinned[read.login_service] if read.login_service else ""
+        passed.append(
+            {"fingerprint": fingerprint(i, generation), "values": values}
+        )
+        write_definition(path, record)
+    # A connection or a source file could change while a probe was in flight.
+    try:
+        current = await asyncio.to_thread(bind, record, plan)
+        for step, before, after in zip(
+            plan.steps, reads, current, strict=True
+        ):
+            if before.revision != after.revision:
+                raise ActionBlocked(
+                    "action_requires_verification", step.key
+                )
+    except ActionBlocked as exc:
+        record.update(
+            reason=exc.code,
+            blocked_step=exc.step or plan.steps[0].key,
+            diagnostic=exc.diagnostic,
+        )
+        write_definition(path, record)
+        return action_view(record)
+    _check_pinned_credentials(reads, pinned)
+    record["status"] = "registered"
+    write_definition(path, record)
+    return action_view(record)
 
 
 def action_tool(
@@ -512,6 +578,11 @@ def action_tool(
     plan = ActionPlan.model_validate(record["plan"])
 
     async def run(_agent_state: AgentState, **inputs) -> dict:
+        from ..app._enterprise_login import (
+            EnterpriseLoginChanged,
+            pin_enterprise_credentials,
+        )
+
         validate(plan.input_schema(), inputs, "Business input")
         # Reload both the publication and the host grants for long-lived tool handles.
         current = json.loads(path.read_bytes())
@@ -524,19 +595,26 @@ def action_tool(
         reads = await asyncio.to_thread(bind, current, plan)
         if current["revisions"] != [r.revision for r in reads]:
             raise ActionBlocked("action_requires_verification")
-        outputs = {}
         needed = plan.projections()
-        for step, read in zip(plan.steps, reads, strict=True):
-            result, outputs[step.key] = await _execute(
-                step,
-                read,
-                inputs,
-                outputs,
-                needed[step.key],
-                _agent_state,
-                verifying=False,
-            )
-        return {"result": result}
+        for _ in range(2):
+            with pin_enterprise_credentials() as pinned:
+                outputs = {}
+                try:
+                    for step, read in zip(plan.steps, reads, strict=True):
+                        result, outputs[step.key] = await _execute(
+                            step,
+                            read,
+                            inputs,
+                            outputs,
+                            needed[step.key],
+                            _agent_state,
+                            verifying=False,
+                        )
+                    _check_pinned_credentials(reads, pinned)
+                    return {"result": result}
+                except EnterpriseLoginChanged:
+                    continue
+        raise ActionBlocked("authentication_changed")
 
     class ActionTool(PublishedBusinessTool):
         async def visible_in_catalog(self, state: AgentState) -> bool:

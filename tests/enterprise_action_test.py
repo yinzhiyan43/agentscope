@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 import httpx
 
+from agentscope.app._enterprise_login import EnterpriseLogin
+from agentscope.app.message_bus import InMemoryMessageBus
+from agentscope.app.tool_login import ToolLogin, tool_login_scope
 from agentscope.business import EnterpriseBusiness, EnterpriseReadAPI
 from agentscope.business._enterprise import enterprise_skill_views
 from agentscope.business._enterprise_action import ActionBlocked
@@ -275,6 +278,132 @@ class EnterpriseActionTest(IsolatedAsyncioTestCase):
             "get_enterprise_action_progress", action_id=item["action_id"]
         )
         self.assertEqual(progress["actions"][0]["status"], "pending")
+
+    async def test_reauthentication_restarts_composed_reads(self):
+        document = json.loads(self.spec.read_text())
+        document["components"] = {
+            "securitySchemes": {
+                "Access": {"type": "http", "scheme": "bearer"},
+            },
+        }
+        document["security"] = [{"Access": []}]
+        source = json.dumps(document)
+        self.spec.write_text(source)
+        inventory = await self.call(
+            "discover_enterprise_actions", source=source
+        )
+        self.inventory = inventory["inventory_id"]
+        operations = {
+            item["route"]: item["name"]
+            for item in inventory["actions"]
+            if item["method"] == "GET"
+        }
+        self.plan["steps"][0]["operation"] = operations["/find"]
+        self.plan["steps"][1]["operation"] = operations["/entries/{key}"]
+
+        broker = ToolLogin(InMemoryMessageBus(), timeout=3)
+        self.svc.login = EnterpriseLogin(broker)
+        scope = ("one", "current", "chat")
+        expired = set()
+        accounts = {"first-account": 7, "new-account": 8, "last-account": 9}
+        requests = []
+
+        def upstream(request):
+            account = request.headers["authorization"].removeprefix("Bearer ")
+            route = request.url.path.removeprefix("/v1")
+            requests.append((account, route))
+            if route == "/find":
+                return httpx.Response(
+                    200,
+                    json={"rows": [{"key": accounts[account], "number": "A"}]},
+                )
+            if account in expired:
+                return httpx.Response(401)
+            self.assertEqual(route, f"/entries/{accounts[account]}")
+            if account == "first-account":
+                return httpx.Response(503)
+            return httpx.Response(
+                200, json={"number": "A", "account": account}
+            )
+
+        self.upstream = upstream
+
+        async def complete_login(action, credential):
+            task = asyncio.create_task(action)
+            try:
+                async with asyncio.timeout(2):
+                    while not (view := broker.pending(scope)):
+                        await asyncio.sleep(0.005)
+                    await broker.submit(
+                        scope,
+                        view.id,
+                        view.revision,
+                        {"credential": credential},
+                    )
+                    return await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+        with tool_login_scope(*scope):
+            first = await complete_login(self.register(), "first-account")
+            self.assertEqual(
+                (first["completed"], first["reason"]), (1, "upstream_http_503")
+            )
+
+            async def resume():
+                return await self.call(
+                    "resume_enterprise_action", action_id=first["action_id"]
+                )
+
+            self.assertEqual((await resume())["completed"], 1)
+            expired.add("first-account")
+            switched = await complete_login(resume(), "new-account")
+            self.assertEqual(
+                (switched["completed"], switched["reason"]),
+                (1, "approved_sample_mismatch"),
+            )
+            self.assertEqual(
+                requests,
+                [("first-account", "/find")]
+                + [("first-account", "/entries/7")] * 3
+                + [("new-account", "/find")],
+            )
+            self.api.samples["/entries/{key}"] = {"path": {"key": 8}}
+            self.assertEqual((await resume())["status"], "registered")
+            self.assertEqual(requests[-1], ("new-account", "/entries/8"))
+
+            (skill,) = await self.svc.tools("one", "current")
+            expired.add("new-account")
+            result = await complete_login(
+                skill.call(_agent_state=self.state, number="A"), "last-account"
+            )
+            self.assertEqual(
+                json.loads(result.content[0].text)["result"]["account"],
+                "last-account",
+            )
+            self.assertEqual(
+                requests[-4:],
+                [
+                    ("new-account", "/find"),
+                    ("new-account", "/entries/8"),
+                    ("last-account", "/find"),
+                    ("last-account", "/entries/9"),
+                ],
+            )
+            # The registered receipt still refers to the previous account.
+            before = len(requests)
+            stale = await resume()
+            self.assertEqual(stale["reason"], "approved_sample_mismatch")
+            self.assertEqual(requests[before:], [("last-account", "/find")])
+
+            directory = self.svc._directory("one", "current") / "actions"
+            (store,) = directory.glob("*.json")
+            receipt = store.read_text()
+            self.assertTrue(
+                all(account not in receipt for account in accounts)
+            )
 
     async def test_source_change_invalidates_only_the_affected_suffix(self):
         source = self.root / "client"

@@ -8,6 +8,7 @@ import re
 import subprocess
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -299,8 +300,14 @@ class EnterpriseBusiness:
                         "unsupported_authentication_contract", step.key
                     ).with_cause("authentication_binding", exc) from exc
                 record = {**record, "authentication": profile}
-            if _login_key(record, api) and self.login is None:
-                raise ActionBlocked("authentication_required", step.key)
+            login_service = _login_key(record, api)
+            credential_generation = None
+            if login_service is not None:
+                if self.login is None:
+                    raise ActionBlocked("authentication_required", step.key)
+                credential_generation = partial(
+                    self.login.credential_generation, login_service
+                )
             sample = api.samples[route]
             revision = _digest(
                 [
@@ -326,14 +333,6 @@ class EnterpriseBusiness:
                         raise ActionBlocked("approved_sample_mismatch")
                 return args
 
-            scope = ""
-            if _login_key(record, api):
-                from ..app.tool_login import LoginEnded
-
-                try:
-                    scope = _digest(self.login.broker.current_scope())
-                except LoginEnded:
-                    pass  # Catalog inspection runs outside a chat.
             try:
                 tool = _runtime(record, api, self.login)
             except ValueError as exc:
@@ -341,7 +340,15 @@ class EnterpriseBusiness:
                     "invalid_read_connection", step.key
                 ) from exc
             reads.append(
-                BoundRead(tool, route, revision, scope, sample, arguments)
+                BoundRead(
+                    tool,
+                    route,
+                    revision,
+                    sample,
+                    arguments,
+                    login_service,
+                    credential_generation,
+                )
             )
         return reads
 
