@@ -86,3 +86,33 @@ for (const [device, width] of [
 		});
 	}
 }
+
+test('private login shows the verification code and localizes the agreement', async (t) => {
+	const browser = await chromium.launch();
+	t.after(() => browser.close());
+	const page = await browser.newPage({ locale: 'en-US', viewport: { width: 390, height: 844 } });
+	await page.addInitScript((base) => {
+		localStorage.setItem('server_url', base);
+		localStorage.setItem('username', 'reader');
+		localStorage.setItem('i18nextLng', 'en');
+		localStorage.setItem('chat_tour_done', '1');
+	}, url);
+	await page.route(/\/sessions\/[^/]+\/tool-login(?:\?|$)/, (route) => route.fulfill({
+		json: { id: 'login', revision: 0, step: {
+			title: 'Sign in', description: '', submit_label: 'Continue',
+			fields: [
+				{ name: 'pass', label: 'Password', kind: 'secret', required: true },
+				{ name: 'otp', label: 'Verification code', kind: 'one-time-code', required: true },
+				{ name: 'terms', label: 'Terms', kind: 'text', agreement: 'Test agreement' },
+			],
+		} },
+	}));
+	await page.goto(`${url}/chat/reader/tickets-mobile`);
+	const code = page.getByLabel('Verification code', { exact: true });
+	await code.fill('0012');
+	assert.equal(await code.getAttribute('type'), 'text');
+	assert.equal(await code.getAttribute('autocomplete'), 'one-time-code');
+	assert.equal(await code.inputValue(), '0012');
+	assert.equal(await page.getByLabel('Password', { exact: true }).getAttribute('type'), 'password');
+	assert.ok(await page.getByText('View full agreement', { exact: true }).isVisible());
+});

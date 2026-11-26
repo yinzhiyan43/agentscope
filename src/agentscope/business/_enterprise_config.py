@@ -53,6 +53,10 @@ class EnterpriseLimits:
             )
 
 
+class LoginAdapterError(ValueError):
+    """A safe configuration reason for a blocked enterprise read."""
+
+
 @dataclass(frozen=True)
 class EnterpriseReadAPI:
     """A deployment-approved API and sample arguments for verified reads."""

@@ -123,18 +123,23 @@ def _visible_conditions(text: str, columns: list[dict]) -> dict[str, str]:
 
 
 def _card_page(result: ToolResultBlock) -> dict | None:
-    if result.state != "success" or not re.fullmatch(
-        r"query_recent_[a-zA-Z0-9_-]+", result.name
-    ):
+    if result.state != "success":
         return None
     page = _json_result(result)
     card = page.get("row_card")
     if (
-        isinstance(card, dict)
-        and card.get("version") == 1
-        and isinstance(page.get("list_ref"), str)
+        not isinstance(card, dict)
+        or card.get("version") != 1
+        or not isinstance(page.get("list_ref"), str)
+        or not page["list_ref"]
     ):
-        return page
+        return None
+    tool = page.get("detail_tool")
+    if tool is None and re.fullmatch(r"query_recent_[a-zA-Z0-9_-]+", result.name):
+        # Existing chat history predates explicit reader bindings.
+        tool = f"open_{result.name.removeprefix('query_recent_')}_row"
+    if isinstance(tool, str) and re.fullmatch(r"open_[a-zA-Z0-9_-]+_row", tool):
+        return {**page, "detail_tool": tool}
     return None
 
 
@@ -165,17 +170,34 @@ def _condition_call_ids(reply: Msg) -> set[str]:
 
 
 def _is_field_request(agent: Agent, text: str) -> bool:
-    if _condition_text(text, quoted=False) is not None:
-        return True
-    if _condition_text(text, quoted=True) is None:
+    explicit = _condition_text(text, quoted=False)
+    selector = explicit or _condition_text(text, quoted=True)
+    if selector is None:
         return False
-    last = next(_history_results(agent), None)
-    return (
-        last is not None
-        and last.state == "success"
-        and bool(re.fullmatch(r"open_[a-zA-Z0-9_-]+_row", last.name))
+    history = _history_results(agent)
+    last = next(history, None)
+    if last is None:
+        return False
+    if explicit is None and not (
+        last.state == "success"
+        and re.fullmatch(r"open_[a-zA-Z0-9_-]+_row", last.name)
         and _json_result(last).get("row_match") == "ambiguous"
+    ):
+        return False
+    if selector[1] or re.search(r"[=＝]", selector[0]):
+        return True
+    if text.strip().rstrip("。！!").endswith(("吗", "么", "呢", "?", "？")):
+        return False
+    page = _card_page(last) or next(
+        (page for result in history if (page := _card_page(result))), None
     )
+    if page is None:
+        return False
+    try:
+        _conditions_for_page(selector[0], page)
+    except ValueError:
+        return False
+    return True
 
 
 class RowCardMiddleware(MiddlewareBase):
@@ -241,9 +263,10 @@ class RowCardMiddleware(MiddlewareBase):
         for result in results:
             page = _card_page(result)
             if page is None:
+                if result.state == "success" and "row_card" in _json_result(result):
+                    raise ValueError("这张列表未绑定详情读取工具。")
                 continue
-            name = result.name.removeprefix("query_recent_")
-            tool = await agent.toolkit.get_tool(f"open_{name}_row")
+            tool = await agent.toolkit.get_tool(page["detail_tool"])
             if not isinstance(tool, OpenRowTool):
                 raise ValueError("当前会话没有这张卡片的只读详情工具。")
             text = self.request.get_text_content()
@@ -337,6 +360,11 @@ class RowCardMiddleware(MiddlewareBase):
                     call_id in condition_calls
                     and payload.get("row_match") == "matched"
                 ):
+                    if "detail" not in payload:
+                        return ChatResponse(
+                            content=[TextBlock(text="详情响应缺少数据，请重新查询。")],
+                            is_last=True,
+                        )
                     payload = payload["detail"]
                 text = (
                     json.dumps(payload, ensure_ascii=False, indent=2)

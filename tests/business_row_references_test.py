@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from utils import MockModel
@@ -228,6 +228,16 @@ class BusinessRowReferencesTest(IsolatedAsyncioTestCase):
         self.assertEqual(result["records"], [{"priority": 0, "subject": "待处理"}])
         self.assertNotIn("list_ref", result)
 
+    def test_invalid_visible_column_names_are_rejected(self):
+        for columns in (
+            (ListColumn("id", " "),),
+            ({"key": "id", "label": "ID"},),
+            (ListColumn("id", "编号"), ListColumn("other", "编号")),
+            (ListColumn("id", "编号"), ListColumn("other", "id")),
+        ):
+            with self.subTest(columns=columns), self.assertRaises(ValueError):
+                ListLayout("列表", columns)
+
     async def test_text_matches_current_purchase_list_without_a_click(self) -> None:
         self.rows = [
             {"id": 41, "billNo": "A-01", "supplierName": "甲厂", "details": ["first"]},
@@ -260,6 +270,9 @@ class BusinessRowReferencesTest(IsolatedAsyncioTestCase):
             await agent.reply(UserMsg("alice", text))
             return agent.state.get_reply_message(agent.name).get_text_content()
 
+        model.set_responses([ChatResponse(content=[TextBlock(text="普通问句")], is_last=True)])
+        self.assertEqual(await ask("打开订单是昨天那张吗？"), "普通问句")
+        model.set_responses([])
         self.assertIn("2 条记录匹配", await ask("获取供应商是甲厂的详情"))
         self.assertEqual(self.calls, ["/api/purchase/order/page"])
         self.assertIn("original", await ask("入库单号=A-02"))
@@ -268,6 +281,9 @@ class BusinessRowReferencesTest(IsolatedAsyncioTestCase):
         self.assertIn("可见列", await ask("获取 id=29 的详情"))
         self.assertEqual(len(self.calls), 2)
         lookup.assert_not_awaited()
+
+        with patch.object(tools[2], "_func", AsyncMock(return_value={"row_match": "matched"})):
+            self.assertIn("详情响应缺少数据", await ask("获取入库单号=A-02的详情"))
 
         model.set_responses([
             ChatResponse(

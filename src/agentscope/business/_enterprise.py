@@ -50,6 +50,7 @@ from ._enterprise_catalog import (
 from ._enterprise_config import (
     EnterpriseLimits,
     EnterpriseReadAPI,
+    LoginAdapterError,
     load_enterprise_config,
 )
 from ._enterprise_convert import (
@@ -336,6 +337,8 @@ class EnterpriseBusiness:
 
             try:
                 tool = _runtime(record, api, self.login)
+            except LoginAdapterError as exc:
+                raise ActionBlocked(str(exc), step.key) from exc
             except ValueError as exc:
                 raise ActionBlocked(
                     "invalid_read_connection", step.key
@@ -782,7 +785,10 @@ class EnterpriseBusiness:
                     subprocess.TimeoutExpired,
                     OSError,
                 ) as exc:
-                    record["reason"] = "verification_failed"
+                    record["reason"] = (
+                        str(exc) if isinstance(exc, LoginAdapterError)
+                        else "verification_failed"
+                    )
                     record["diagnostic"] = report_failure(
                         record["reason"], "read_probe", exc
                     )

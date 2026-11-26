@@ -261,6 +261,7 @@
 		"toolLogin": {
 			"enterprise": {
 				"authTitle": "接口认证",
+				"viewAgreement": "查看完整协议",
 				"requestCode": "获取验证码",
 				"renewCode": "验证码已失效，请重新获取",
 				"chooseTitle": "选择认证参数",

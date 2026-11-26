@@ -14,7 +14,7 @@ from agentscope.tool._business_search import PublishedBusinessTool
 
 from ._business import as_tool, preview
 from ._business import definition_digest as _digest
-from ._enterprise_config import EnterpriseLimits, EnterpriseReadAPI
+from ._enterprise_config import EnterpriseLimits, EnterpriseReadAPI, LoginAdapterError
 
 if TYPE_CHECKING:
     from ..app._enterprise_login import EnterpriseLogin
@@ -354,6 +354,8 @@ def bindings(
                         tools[record["name"]] = _runtime(
                             record, reads[0], login
                         )
+                    except LoginAdapterError as exc:
+                        record.update(status="pending", reason=str(exc))
                     except ValueError:
                         record.update(
                             status="pending", reason="invalid_read_connection"

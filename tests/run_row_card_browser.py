@@ -67,7 +67,10 @@ async def run(directory: Path, stack: ExitStack) -> None:
             return await read(owner, limit)
 
         rows.list_rows = page
-        return rows.tools()
+        tools = rows.tools()
+        if source is fixture.ticket:
+            tools[1].name = "search_inbox"
+        return tools
 
     async def model_for(
         _user: str,
@@ -81,7 +84,7 @@ async def run(directory: Path, stack: ExitStack) -> None:
                     content=[
                         ToolCallBlock(
                             id=uuid4().hex,
-                            name=f"query_recent_{config.model}",
+                            name="search_inbox" if config.model == "tickets" else f"query_recent_{config.model}",
                             input='{"limit":2}',
                         ),
                     ],

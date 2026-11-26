@@ -10,12 +10,11 @@ export interface EnterpriseSkill {
 
 export interface EnterpriseAction {
 	action_id: string;
-	visible?: boolean;
-	title?: string | null;
-	status?: 'pending' | 'registered' | null;
-	completed?: number | null;
-	total?: number | null;
-	can_resume?: boolean;
+	title: string;
+	status: 'pending' | 'registered';
+	completed: number;
+	total: number;
+	can_resume: boolean;
 }
 
 interface EnterpriseActionPage {

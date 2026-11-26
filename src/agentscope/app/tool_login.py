@@ -536,6 +536,8 @@ class ToolLogin:
                     if pending.result.done():
                         raise LoginEnded("This login request has ended.")
                     result = completion.result()
+                    if not isinstance(result, (LoginSuccess, LoginStep)):
+                        raise TypeError("Invalid login step result")
                 finally:
                     completion.cancel()
                     await asyncio.gather(completion, return_exceptions=True)
@@ -548,6 +550,12 @@ class ToolLogin:
                     LoginFailed(str(exc), code=exc.code, params=exc.params),
                 )
                 raise
+            except (LoginRejected, LoginConflict, LoginEnded):
+                raise
+            except Exception:
+                failure = LoginFailed("The authentication adapter could not complete this step.")
+                self._finish(key, pending, failure)
+                raise failure from None
             if self._pending.get(key) is not pending:
                 raise LoginEnded("This login request has ended.")
             if isinstance(result, LoginSuccess):

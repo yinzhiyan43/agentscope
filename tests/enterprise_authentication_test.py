@@ -3,14 +3,16 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from agentscope.app import EnterpriseLoginAdapter
+from agentscope.app import EnterpriseLoginAdapter, create_app
+from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.app._enterprise_login import EnterpriseLogin
 from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.tool_login import (
@@ -334,7 +336,9 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
                 LoginRecipe.model_validate(config),
             )
 
-    async def test_host_adapter_for_verification_and_registered_query(self):
+    async def test_create_app_binds_configured_adapter_to_verification_and_queries(
+        self,
+    ):
         source = json.dumps(definition())
         base = "https://reports.test"
         issued = []
@@ -365,24 +369,53 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
             root = Path(tmp)
             spec = root / "reports.json"
             spec.write_text(source)
-            samples = {"/reports/count": {}}
-            api = EnterpriseReadAPI(
-                spec, base, samples, login_adapter="reports"
+            config = root / "connections.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "directory": str(root / "imports"),
+                        "read_apis": {
+                            "owner": [
+                                {
+                                    "document": str(spec),
+                                    "base_url": base,
+                                    "samples": {"/reports/count": {}},
+                                    "login_adapter": "reports",
+                                }
+                            ]
+                        },
+                    }
+                )
             )
-            self.assertNotEqual(
-                api.key, EnterpriseReadAPI(spec, base, samples).key
+            storage = AsyncMock()
+            storage.get_agent.return_value = None
+            kwargs = dict(
+                storage=storage,
+                workspace_manager=LocalWorkspaceManager(tmp),
+                message_bus=InMemoryMessageBus(),
+                tool_login=broker,
             )
-            converter = EnterpriseBusiness(
-                root / "imports", read_apis={"owner": [api]}
-            )
-            converter.login = EnterpriseLogin(
-                broker, adapters={"reports": EnterpriseLoginAdapter(issue)}
-            )
-            result = await converter.convert(
+            with patch.dict(
+                os.environ,
+                {"AGENTSCOPE_ENTERPRISE_BUSINESS_CONFIG": str(config)},
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "Unregistered.*reports"
+                ):
+                    create_app(**kwargs)
+                app = create_app(
+                    **kwargs,
+                    enterprise_login_adapters={
+                        "reports": EnterpriseLoginAdapter(issue)
+                    },
+                )
+            result = await app.state.enterprise_business.convert(
                 "owner", "agent", source, business_scope="/reports/count"
             )
             self.assertEqual(result["tools"][0]["status"], "registered")
-            (tool,) = await converter.tools("owner", "agent")
+            (tool,) = await app.state.extra_agent_tools(
+                "owner", "agent", "chat"
+            )
             await tool.call()
             self.assertEqual(len(issued), 1)
             self.assertEqual(reads, [("/reports/count", "report-ticket")] * 2)
@@ -613,7 +646,7 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
         doc["paths"]["/whoami"] = doc["paths"]["/reports/count"]
         project["identity"] = {
             "route": "/whoami",
-            "fields": {"station": "/current"},
+            "fields": {"station": "/current", "cluster": "/group"},
         }
         project["expired"] = [
             {"status": 200, "fields": {"error.name": "ticket-ended"}}
@@ -647,7 +680,7 @@ class EnterpriseAuthenticationTest(IsolatedAsyncioTestCase):
                 data = {"session": {"key": "new" if read_headers else "old"}}
             elif path == "/whoami":
                 self.assertIn("X-Ticket", request.headers)
-                data = {"current": "mine" if confirmed else "other"}
+                data = {"current": "mine", "group": "7" if confirmed else "07"}
             else:
                 read_headers.append(request.headers["X-Ticket"])
                 data = (

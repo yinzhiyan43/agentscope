@@ -262,6 +262,7 @@
 		"toolLogin": {
 			"enterprise": {
 				"authTitle": "API authentication",
+				"viewAgreement": "View full agreement",
 				"requestCode": "Request verification code",
 				"renewCode": "Verification code expired. Request a new code.",
 				"chooseTitle": "Select an authentication value",

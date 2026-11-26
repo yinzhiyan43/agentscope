@@ -308,6 +308,24 @@ class ToolLoginTest(unittest.IsolatedAsyncioTestCase):
                 await operation
             self.assertIsNone(broker.pending(scope))
 
+    async def test_unexpected_adapter_error_finishes_waiting_tool(self):
+        broker = ToolLogin(InMemoryMessageBus())
+        scope = ("user", "agent", "chat")
+        step = LoginStep(title="Login", description="", submit_label="Submit", fields=[])
+
+        async def broken(*_):
+            raise KeyError("private-data")
+
+        with tool_login_scope(*scope):
+            operation = asyncio.create_task(broker.request("service", step, broken))
+            await asyncio.sleep(0)
+            view = broker.pending(scope)
+            with self.assertRaisesRegex(LoginFailed, "adapter"):
+                await broker.submit(scope, view.id, view.revision, {})
+            with self.assertRaisesRegex(LoginFailed, "adapter"):
+                await asyncio.wait_for(operation, 1)
+            self.assertIsNone(broker.pending(scope))
+
     async def test_service_controls_expiry_and_only_get_is_retried(
         self,
     ) -> None:

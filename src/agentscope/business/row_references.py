@@ -361,6 +361,7 @@ class RowDetailTools:
             conn.commit()
         return {
             "list_ref": ref,
+            "detail_tool": f"open_{self.name}_row",
             **display,
         }
 

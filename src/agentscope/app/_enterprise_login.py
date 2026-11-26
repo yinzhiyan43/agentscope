@@ -2,7 +2,9 @@
 """Authenticate enterprise reads using the current chat's private login form."""
 
 import asyncio
+import hmac
 import json
+import secrets
 from collections import OrderedDict
 from collections.abc import (
     AsyncGenerator,
@@ -22,7 +24,7 @@ import httpx
 from jsonschema import Draft202012Validator, FormatChecker
 
 from ..business._business import validate_api_base_url
-from ..business._enterprise_config import EnterpriseLimits
+from ..business._enterprise_config import EnterpriseLimits, LoginAdapterError
 from ..business._response_match import ResponseMatch
 from .tool_login import (
     LoginEnded,
@@ -75,6 +77,9 @@ def _matches_lookup(row: Any, filters: dict, payload: dict) -> bool:
         )
     except (IndexError, KeyError, TypeError):
         return False
+
+
+_identity_key = secrets.token_bytes(32)
 
 
 def _same_value(left: Any, right: Any) -> bool:
@@ -194,6 +199,7 @@ async def _login(
                     ),
                     required=lookup
                     or required
+                    or name in login.get("identity", {}).get("fields", {})
                     or name == challenge.get("answer")
                     or name in schema.get("required", []),
                 )
@@ -417,18 +423,27 @@ async def _login(
                 )
                 identity_response.raise_for_status()
                 info = identity_response.json()
-                try:
-                    identity = []
-                    for name, pointer in sorted(check["fields"].items()):
+                identity = []
+                for name, pointer in sorted(check["fields"].items()):
+                    try:
                         actual = _at(info, pointer)
-                        if actual is None or not _same_value(
-                            actual, body[name]
-                        ):
-                            raise ValueError
-                        identity.append(json.dumps(actual, sort_keys=True))
-                except (KeyError, IndexError, TypeError, ValueError):
-                    raise LoginRejected("登录身份与所选条件不一致。") from None
-                return header, tuple(identity)
+                    except (KeyError, IndexError, TypeError):
+                        raise LoginFailed(
+                            "身份查询缺少配置的身份字段。"
+                        ) from None
+                    expected = body[name]
+                    # Only an explicitly integer login field accepts its
+                    # canonical decimal representation from the identity GET.
+                    if not _same_value(actual, expected) and not (
+                        props[name].get("type") == "integer"
+                        and type(expected) is int
+                        and actual == str(expected)
+                    ):
+                        raise LoginRejected("登录身份与所选条件不一致。")
+                    if expected is None:
+                        raise LoginRejected("身份字段不能为空。")
+                    identity.append(expected)
+                return header, (json.dumps(identity, sort_keys=True),)
             except (httpx.HTTPError, ValueError):
                 raise LoginFailed(
                     "The authentication response does not match the interface definition.",
@@ -591,6 +606,15 @@ class EnterpriseLogin:
         else:
             value, identity = await adapter.login(self.broker, service, base)
             header = _header_value(value, profile["mode"])
+        if identity is not None:
+            # Preserve opaque adapter components while keeping textual login
+            # identifiers out of the credential cache.
+            identity = tuple(
+                (str, hmac.digest(_identity_key, value.encode(), "sha256"))
+                if isinstance(value, str)
+                else (type(value), value)
+                for value in identity
+            )
         credential = _Credential(header, identity)
         self._headers[key] = credential
         if len(self._headers) > self._max_cached_credentials:
@@ -637,17 +661,13 @@ class EnterpriseLogin:
     ) -> httpx.Auth:
         validate_api_base_url(base, authenticated=True)
         selected_adapter = self._adapters.get(adapter) if adapter else None
-        if adapter and (
-            selected_adapter is None
-            or profile["mode"] not in ("header", "bearer")
-        ):
-            raise ValueError(
-                "Unknown or incompatible enterprise login adapter"
-            )
+        if adapter is not None and selected_adapter is None:
+            raise LoginAdapterError("unknown_login_adapter")
+        if selected_adapter and profile["mode"] not in ("header", "bearer"):
+            raise LoginAdapterError("incompatible_login_adapter")
         if profile.get("client") and not selected_adapter:
-            raise ValueError(
-                "This saved login requires a configured host adapter"
-            )
+            # Persisted profiles from older imports must still fail closed.
+            raise LoginAdapterError("login_adapter_required")
         expiry = (
             selected_adapter.expired
             if selected_adapter

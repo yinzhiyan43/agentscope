@@ -15,7 +15,7 @@ function readCard(result: ToolResultBlock) {
 	const text = getResultText(result);
 	if (!text.includes('"row_card"')) return null;
 	try {
-		const { row_card: card, records, list_ref: ref } = JSON.parse(text);
+		const { row_card: card, records, list_ref: ref, detail_tool: reader } = JSON.parse(text);
 		if (
 			card?.version !== 1 ||
 			typeof card.title !== 'string' ||
@@ -33,7 +33,10 @@ function readCard(result: ToolResultBlock) {
 			title: card.title as string,
 			columns: card.columns as { key: string; label: string }[],
 			records: records as Record<string, unknown>[],
-			canOpen: typeof ref === 'string' && ref.length > 0 && /^query_recent_[a-zA-Z0-9_-]+$/.test(result.name),
+			canOpen: typeof ref === 'string' && ref.length > 0 && (
+				reader == null ? /^query_recent_[a-zA-Z0-9_-]+$/.test(result.name)
+					: typeof reader === 'string' && /^open_[a-zA-Z0-9_-]+_row$/.test(reader)
+			),
 		};
 	} catch {
 		return null;

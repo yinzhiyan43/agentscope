@@ -160,7 +160,7 @@ function LoginForm({
 								{field.agreement ? (
 									<>
 										<details>
-											<summary>查看完整协议</summary>
+											<summary>{t('chat.toolLogin.enterprise.viewAgreement')}</summary>
 											<div className="max-h-48 overflow-y-auto whitespace-pre-wrap">{field.agreement}</div>
 										</details>
 										<input id={id} type="checkbox" name={field.name} value="yes"
@@ -187,7 +187,7 @@ function LoginForm({
 										id={id}
 										name={field.name}
 										list={field.suggestions?.length ? id + '-options' : undefined}
-										type={field.kind === 'text' ? 'text' : 'password'}
+										type={field.kind === 'secret' ? 'password' : 'text'}
 										autoComplete={field.kind === 'one-time-code' ? 'one-time-code' : 'off'}
 										required={field.required}
 										disabled={pending}

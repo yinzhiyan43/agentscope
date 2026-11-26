@@ -21,13 +21,24 @@ class ListLayout:
     columns: tuple[ListColumn, ...]
 
     def __post_init__(self) -> None:
-        keys = [column.key for column in self.columns]
-        if (
-            not self.title
-            or any(not key for key in keys)
-            or len(set(keys)) != len(keys)
-        ):
-            raise ValueError("List columns must have unique, nonempty keys.")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("List title must be a nonempty string.")
+        keys = set()
+        names = {}
+        for column in self.columns:
+            if not isinstance(column, ListColumn) or not all(
+                isinstance(name, str) and name.strip()
+                for name in (column.key, column.label)
+            ):
+                raise ValueError("List columns need a nonempty key and label.")
+            if column.key in keys:
+                raise ValueError("Duplicate list column key.")
+            keys.add(column.key)
+            for name in (column.key, column.label):
+                if names.setdefault(name, column.key) != column.key:
+                    raise ValueError(
+                        "List column names must identify a single column."
+                    )
 
     def project(self, row: dict) -> dict:
         """Expose visible scalar cells after connector normalization."""

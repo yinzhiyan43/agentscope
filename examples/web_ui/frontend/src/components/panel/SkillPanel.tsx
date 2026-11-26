@@ -132,7 +132,7 @@ export function SkillPanel({
 	const showBusiness = business.isSuccess && (!query || businessSkills.length > 0);
 	const actionRows = (actions.data?.pages ?? []).flatMap((page) => page.actions);
 	const visibleActions = [...new Map(actionRows.map((action) => [action.action_id, action])).values()]
-		.filter((action) => action.visible !== false && action.title?.trim() && (
+		.filter((action) => action.title.trim() && (
 			action.title.toLocaleLowerCase().includes(query)
 			|| (action.status && t('panel.skill.businessActions.' + action.status).toLocaleLowerCase().includes(query))
 		));

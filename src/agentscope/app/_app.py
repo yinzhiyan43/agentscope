@@ -377,6 +377,13 @@ def create_app(
     enterprise_business = (
         enterprise_business or EnterpriseBusiness.from_environment()
     )
+    for connections in enterprise_business.read_apis.values():
+        for api in connections:
+            if api.login_adapter is not None and not isinstance(
+                (enterprise_login_adapters or {}).get(api.login_adapter),
+                EnterpriseLoginAdapter,
+            ):
+                raise ValueError(f"Unregistered enterprise login adapter: {api.login_adapter!r}")
     app.state.enterprise_business = enterprise_business
     tool_login = tool_login or ToolLogin(message_bus)
     enterprise_business.login = EnterpriseLogin(

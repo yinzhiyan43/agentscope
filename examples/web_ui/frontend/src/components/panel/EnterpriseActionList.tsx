@@ -54,7 +54,7 @@ export function EnterpriseActionList({
 									<Progress className="mt-1" value={progress.value} aria-label={progress.text} />
 								)}
 							</ItemContent>
-							{status === 'pending' && can_resume !== false && (
+							{status === 'pending' && can_resume && (
 								<Button
 									type="button"
 									variant="outline"
